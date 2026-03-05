@@ -285,6 +285,11 @@
   color: #c8d8f4;
 }
 
+.filebar-checkbox-col {
+  width: 38px;
+  text-align: center !important;
+}
+
 .filebar-table th {
   position: sticky;
   top: 0;
@@ -368,6 +373,12 @@
   color: #d7e6ff;
   background: #152742;
   cursor: pointer;
+}
+
+.transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .transfer-empty {

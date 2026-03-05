@@ -8,7 +8,8 @@ use lastsheel_core::{
     HostItemDto, HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
     TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
     TransferDownloadInputDto, TransferStartDto, TransferState, TransferUpdateEventDto,
-    TransferUploadInputDto, VaultStatusDto,
+    TransferUploadInputDto, TransferVerifyEventDto, TransferVerifyResultDto, TransferVerifyState,
+    VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -60,9 +61,18 @@ struct TransferControl {
     canceled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct TransferRecord {
+    transfer_id: String,
+    direction: String,
+    local_path: Option<PathBuf>,
+    state: TransferState,
+}
+
 #[derive(Default)]
 struct TransferManager {
     items: Mutex<HashMap<String, TransferControl>>,
+    records: Mutex<HashMap<String, TransferRecord>>,
 }
 
 #[derive(Default)]
@@ -137,6 +147,24 @@ fn emit_transfer_update(
             state,
             done_bytes,
             total_bytes,
+            message,
+        },
+    );
+}
+
+fn emit_transfer_verify(
+    app: &tauri::AppHandle,
+    transfer_id: &str,
+    state: TransferVerifyState,
+    sha256: Option<String>,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        "transfer.verify",
+        TransferVerifyEventDto {
+            transfer_id: transfer_id.to_string(),
+            state,
+            sha256,
             message,
         },
     );
@@ -417,6 +445,20 @@ fn normalize_auth_mode(input: &str) -> String {
     }
 }
 
+fn normalize_conflict_policy(input: Option<&str>, default_value: &str) -> String {
+    match input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_value)
+        .to_lowercase()
+        .as_str()
+    {
+        "overwrite" => "overwrite".to_string(),
+        "skip" => "skip".to_string(),
+        _ => "rename".to_string(),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn prepare_one_time_password(
     auth_mode: &str,
@@ -660,7 +702,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
-        "文件栏 SFTP 目录列表 + 传输队列（阶段2）".to_string(),
+        "文件栏与传输增强（批量下载 + 冲突策略 + SHA256 校验，阶段3）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -1303,6 +1345,7 @@ fn resolve_download_target_path(
     host: &HostItemDto,
     remote_path: &str,
     local_path: Option<String>,
+    conflict_policy: &str,
 ) -> Result<PathBuf, ErrorDto> {
     let candidate = local_path
         .map(|value| value.trim().to_string())
@@ -1329,7 +1372,63 @@ fn resolve_download_target_path(
         .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "无效的下载路径"))?;
     fs::create_dir_all(parent)
         .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建下载目录失败"))?;
-    Ok(resolve_conflict_path(candidate))
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    match conflict_policy {
+        "overwrite" => Ok(candidate),
+        "skip" => Err(ErrorDto::new(
+            ErrorCode::Conflict,
+            format!("目标文件已存在：{}", path_to_string(&candidate)),
+        )),
+        _ => Ok(resolve_conflict_path(candidate)),
+    }
+}
+
+fn resolve_remote_conflict_path(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    conflict_policy: &str,
+) -> Result<String, ErrorDto> {
+    let original = Path::new(remote_path);
+    let exists = sftp.stat(original).is_ok();
+    if !exists {
+        return Ok(remote_path.to_string());
+    }
+    match conflict_policy {
+        "overwrite" => Ok(remote_path.to_string()),
+        "skip" => Err(ErrorDto::new(
+            ErrorCode::Conflict,
+            format!("远端文件已存在：{remote_path}"),
+        )),
+        _ => {
+            let parent = original.parent().unwrap_or_else(|| Path::new(""));
+            let stem = original
+                .file_stem()
+                .and_then(|item| item.to_str())
+                .unwrap_or("upload")
+                .to_string();
+            let ext = original
+                .extension()
+                .and_then(|item| item.to_str())
+                .unwrap_or("")
+                .to_string();
+            for index in 1..10000 {
+                let file_name = if ext.is_empty() {
+                    format!("{stem} ({index})")
+                } else {
+                    format!("{stem} ({index}).{ext}")
+                };
+                let candidate = parent.join(file_name);
+                if sftp.stat(&candidate).is_err() {
+                    return Ok(path_to_string(&candidate));
+                }
+            }
+            Ok(path_to_string(
+                &parent.join(format!("{stem}-{}", Uuid::new_v4())),
+            ))
+        }
+    }
 }
 
 fn insert_transfer_control(
@@ -1346,9 +1445,44 @@ fn insert_transfer_control(
     canceled
 }
 
+fn upsert_transfer_record(transfer_manager: &State<TransferManager>, record: TransferRecord) {
+    transfer_manager
+        .records
+        .lock()
+        .insert(record.transfer_id.clone(), record);
+}
+
+fn update_transfer_record_state(
+    transfer_manager: &State<TransferManager>,
+    transfer_id: &str,
+    state: TransferState,
+) {
+    if let Some(record) = transfer_manager.records.lock().get_mut(transfer_id) {
+        record.state = state;
+    }
+}
+
 fn remove_transfer_control(app: &tauri::AppHandle, transfer_id: &str) {
     let transfer_manager = app.state::<TransferManager>();
     transfer_manager.items.lock().remove(transfer_id);
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, ErrorDto> {
+    let mut file =
+        fs::File::open(path).map_err(|_| ErrorDto::new(ErrorCode::NotFound, "本地文件不存在"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let size = file
+            .read(&mut buffer)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取本地文件失败"))?;
+        if size == 0 {
+            break;
+        }
+        hasher.update(&buffer[..size]);
+    }
+    let digest = hasher.finalize();
+    Ok(format!("{digest:x}"))
 }
 
 #[tauri::command]
@@ -1361,6 +1495,7 @@ fn transfer_download(
     input: TransferDownloadInputDto,
 ) -> Result<TransferStartDto, ErrorDto> {
     let remote_path = input.remote_path.trim().to_string();
+    let conflict_policy = normalize_conflict_policy(input.conflict_policy.as_deref(), "rename");
     if remote_path.is_empty() {
         return Err(ErrorDto::new(ErrorCode::Unsupported, "远端路径不能为空"));
     }
@@ -1375,11 +1510,25 @@ fn transfer_download(
     let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
     let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
     ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
-    let resolved_local_path =
-        resolve_download_target_path(&app, &host, &remote_path, input.local_path)?;
+    let resolved_local_path = resolve_download_target_path(
+        &app,
+        &host,
+        &remote_path,
+        input.local_path,
+        &conflict_policy,
+    )?;
 
     let transfer_id = Uuid::new_v4().to_string();
     let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
+    upsert_transfer_record(
+        &transfer_manager,
+        TransferRecord {
+            transfer_id: transfer_id.clone(),
+            direction: "download".to_string(),
+            local_path: Some(resolved_local_path.clone()),
+            state: TransferState::Queued,
+        },
+    );
     emit_transfer_update(
         &app,
         &transfer_id,
@@ -1393,6 +1542,8 @@ fn transfer_download(
     let transfer_id_for_thread = transfer_id.clone();
     let resolved_local_path_for_thread = resolved_local_path.clone();
     thread::spawn(move || {
+        let manager = app_handle.state::<TransferManager>();
+        update_transfer_record_state(&manager, &transfer_id_for_thread, TransferState::Running);
         emit_transfer_update(
             &app_handle,
             &transfer_id_for_thread,
@@ -1442,23 +1593,33 @@ fn transfer_download(
         })();
 
         match run_result {
-            Ok((done_bytes, total_bytes)) => emit_transfer_update(
-                &app_handle,
-                &transfer_id_for_thread,
-                TransferState::Done,
-                done_bytes,
-                total_bytes,
-                Some(format!(
-                    "下载完成：{}",
-                    path_to_string(&resolved_local_path_for_thread)
-                )),
-            ),
+            Ok((done_bytes, total_bytes)) => {
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(
+                    &manager,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                );
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                    done_bytes,
+                    total_bytes,
+                    Some(format!(
+                        "下载完成：{}",
+                        path_to_string(&resolved_local_path_for_thread)
+                    )),
+                )
+            }
             Err(error) => {
                 let state = if matches!(error.code, ErrorCode::Canceled) {
                     TransferState::Canceled
                 } else {
                     TransferState::Error
                 };
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(&manager, &transfer_id_for_thread, state.clone());
                 emit_transfer_update(
                     &app_handle,
                     &transfer_id_for_thread,
@@ -1475,6 +1636,7 @@ fn transfer_download(
     Ok(TransferStartDto {
         transfer_id,
         resolved_local_path: Some(path_to_string(&resolved_local_path)),
+        resolved_remote_path: None,
     })
 }
 
@@ -1488,8 +1650,9 @@ fn transfer_upload(
     input: TransferUploadInputDto,
 ) -> Result<TransferStartDto, ErrorDto> {
     let local_path = input.local_path.trim().to_string();
-    let remote_path = input.remote_path.trim().to_string();
-    if local_path.is_empty() || remote_path.is_empty() {
+    let remote_path_input = input.remote_path.trim().to_string();
+    let conflict_policy = normalize_conflict_policy(input.conflict_policy.as_deref(), "rename");
+    if local_path.is_empty() || remote_path_input.is_empty() {
         return Err(ErrorDto::new(
             ErrorCode::Unsupported,
             "本地路径和远端路径不能为空",
@@ -1511,9 +1674,21 @@ fn transfer_upload(
     let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
     let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
     ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+    let preview_sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+    let remote_path =
+        resolve_remote_conflict_path(&preview_sftp, &remote_path_input, &conflict_policy)?;
 
     let transfer_id = Uuid::new_v4().to_string();
     let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
+    upsert_transfer_record(
+        &transfer_manager,
+        TransferRecord {
+            transfer_id: transfer_id.clone(),
+            direction: "upload".to_string(),
+            local_path: Some(local_path_buf.clone()),
+            state: TransferState::Queued,
+        },
+    );
     emit_transfer_update(
         &app,
         &transfer_id,
@@ -1525,7 +1700,10 @@ fn transfer_upload(
 
     let app_handle = app.clone();
     let transfer_id_for_thread = transfer_id.clone();
+    let remote_path_for_thread = remote_path.clone();
     thread::spawn(move || {
+        let manager = app_handle.state::<TransferManager>();
+        update_transfer_record_state(&manager, &transfer_id_for_thread, TransferState::Running);
         emit_transfer_update(
             &app_handle,
             &transfer_id_for_thread,
@@ -1540,13 +1718,13 @@ fn transfer_upload(
                 .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "读取本地文件失败"))?;
             let total_bytes = local_file.metadata().ok().map(|meta| meta.len());
             let mut remote_file = sftp
-                .create(Path::new(&remote_path))
+                .create(Path::new(&remote_path_for_thread))
                 .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端文件失败"))?;
             let mut buffer = vec![0_u8; 64 * 1024];
             let mut done_bytes = 0_u64;
             loop {
                 if canceled.load(Ordering::Relaxed) {
-                    let _ = sftp.unlink(Path::new(&remote_path));
+                    let _ = sftp.unlink(Path::new(&remote_path_for_thread));
                     return Err(ErrorDto::new(ErrorCode::Canceled, "上传已取消"));
                 }
                 let read_size = local_file
@@ -1572,20 +1750,30 @@ fn transfer_upload(
         })();
 
         match run_result {
-            Ok((done_bytes, total_bytes)) => emit_transfer_update(
-                &app_handle,
-                &transfer_id_for_thread,
-                TransferState::Done,
-                done_bytes,
-                total_bytes,
-                Some("上传完成".to_string()),
-            ),
+            Ok((done_bytes, total_bytes)) => {
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(
+                    &manager,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                );
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                    done_bytes,
+                    total_bytes,
+                    Some("上传完成".to_string()),
+                )
+            }
             Err(error) => {
                 let state = if matches!(error.code, ErrorCode::Canceled) {
                     TransferState::Canceled
                 } else {
                     TransferState::Error
                 };
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(&manager, &transfer_id_for_thread, state.clone());
                 emit_transfer_update(
                     &app_handle,
                     &transfer_id_for_thread,
@@ -1602,6 +1790,7 @@ fn transfer_upload(
     Ok(TransferStartDto {
         transfer_id,
         resolved_local_path: None,
+        resolved_remote_path: Some(remote_path),
     })
 }
 
@@ -1616,6 +1805,72 @@ fn transfer_cancel(
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "传输任务不存在"))?;
     control.canceled.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[tauri::command]
+fn transfer_verify_sha256(
+    app: tauri::AppHandle,
+    transfer_manager: State<TransferManager>,
+    transfer_id: String,
+) -> Result<TransferVerifyResultDto, ErrorDto> {
+    emit_transfer_verify(
+        &app,
+        &transfer_id,
+        TransferVerifyState::Running,
+        None,
+        Some("开始计算 SHA256".to_string()),
+    );
+    let verify_result = (|| -> Result<(String, PathBuf), ErrorDto> {
+        let record = transfer_manager
+            .records
+            .lock()
+            .get(&transfer_id)
+            .cloned()
+            .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "传输任务不存在"))?;
+        if record.direction != "download" {
+            return Err(ErrorDto::new(
+                ErrorCode::Unsupported,
+                "仅下载任务支持 SHA256 校验",
+            ));
+        }
+        if !matches!(record.state, TransferState::Done) {
+            return Err(ErrorDto::new(
+                ErrorCode::Unsupported,
+                "仅已完成的下载任务可执行 SHA256 校验",
+            ));
+        }
+        let local_path = record
+            .local_path
+            .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "本地文件路径不存在"))?;
+        let sha256 = sha256_file_hex(&local_path)?;
+        Ok((sha256, local_path))
+    })();
+
+    match verify_result {
+        Ok((sha256, local_path)) => {
+            emit_transfer_verify(
+                &app,
+                &transfer_id,
+                TransferVerifyState::Done,
+                Some(sha256.clone()),
+                Some(format!("SHA256 校验完成：{}", path_to_string(&local_path))),
+            );
+            Ok(TransferVerifyResultDto {
+                ok: true,
+                sha256: Some(sha256),
+            })
+        }
+        Err(error) => {
+            emit_transfer_verify(
+                &app,
+                &transfer_id,
+                TransferVerifyState::Error,
+                None,
+                Some(error.message.clone()),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn spawn_terminal_with_command(
@@ -1933,6 +2188,7 @@ pub fn run() {
             transfer_download,
             transfer_upload,
             transfer_cancel,
+            transfer_verify_sha256,
             terminal_spawn_local,
             terminal_connect_ssh,
             terminal_write,

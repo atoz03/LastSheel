@@ -15,6 +15,8 @@ import type {
   TransferStartResponse,
   TransferState,
   TransferUpdatePayload,
+  TransferVerifyPayload,
+  TransferVerifyResponse,
 } from "./types";
 import "./hosts-workspace.css";
 
@@ -28,6 +30,8 @@ const SNIPPETS = [
 
 const HISTORY_LIMIT = 500;
 const DEFAULT_PORT = 22;
+const EMPTY_REMOTE_ENTRIES: RemoteFileEntry[] = [];
+const EMPTY_PATHS: string[] = [];
 
 type HostItem = {
   host_id: string;
@@ -76,6 +80,7 @@ type TransferItem = {
   done_bytes: number;
   total_bytes?: number | null;
   message?: string;
+  sha256?: string;
 };
 
 function getInvokeError(error: unknown): { code?: string; message: string } {
@@ -153,6 +158,24 @@ function formatTransferProgress(doneBytes: number, totalBytes?: number | null): 
   return formatFileSize(doneBytes);
 }
 
+function askConflictPolicy(defaultValue: "rename" | "overwrite" | "skip" = "rename"): "rename" | "overwrite" | "skip" | null {
+  const value = window.prompt(
+    "同名冲突策略：rename(重命名) / overwrite(覆盖) / skip(跳过)",
+    defaultValue,
+  );
+  if (value === null) {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "overwrite") {
+    return "overwrite";
+  }
+  if (normalized === "skip") {
+    return "skip";
+  }
+  return "rename";
+}
+
 function createTab(
   title: string,
   pane: TerminalPaneModel,
@@ -196,6 +219,7 @@ export function HostsWorkspace() {
   const [remotePathInputByTab, setRemotePathInputByTab] = useState<Record<string, string>>({});
   const [remoteLoadingTabId, setRemoteLoadingTabId] = useState<string | null>(null);
   const [selectedRemotePathByTab, setSelectedRemotePathByTab] = useState<Record<string, string>>({});
+  const [checkedRemotePathsByTab, setCheckedRemotePathsByTab] = useState<Record<string, string[]>>({});
   const [transferItems, setTransferItems] = useState<TransferItem[]>([]);
   const [transferBusy, setTransferBusy] = useState(false);
   const inputBufferRef = useRef<Record<string, string>>({});
@@ -581,6 +605,14 @@ export function HostsWorkspace() {
           }
           return { ...prev, [tab.tab_id]: "" };
         });
+        setCheckedRemotePathsByTab((prev) => {
+          const current = prev[tab.tab_id] ?? [];
+          const filtered = current.filter((path) => response.entries.some((entry) => entry.path === path));
+          if (filtered.length === current.length) {
+            return prev;
+          }
+          return { ...prev, [tab.tab_id]: filtered };
+        });
       } catch (error: unknown) {
         const payload = getInvokeError(error);
         if (payload.code === "AUTH_FAILED") {
@@ -625,6 +657,7 @@ export function HostsWorkspace() {
           done_bytes: nextItem.done_bytes ?? 0,
           total_bytes: nextItem.total_bytes ?? null,
           message: nextItem.message,
+          sha256: nextItem.sha256,
         };
         return [created, ...prev].slice(0, 20);
       }
@@ -659,6 +692,11 @@ export function HostsWorkspace() {
       setNotice("已取消下载。");
       return;
     }
+    const conflictPolicy = askConflictPolicy("rename");
+    if (conflictPolicy === null) {
+      setNotice("已取消下载。");
+      return;
+    }
     const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
     if (host.auth_mode === "password" && password === null) {
       return;
@@ -671,6 +709,7 @@ export function HostsWorkspace() {
           remotePath: remoteEntry.path,
           localPath: customLocalPath.trim() ? customLocalPath.trim() : null,
           password,
+          conflictPolicy,
         },
       });
       upsertTransferItem({
@@ -694,6 +733,64 @@ export function HostsWorkspace() {
       setTransferBusy(false);
     }
   }, [activeTab, hostById, remoteEntriesByTab, requestPasswordForHost, selectedRemotePathByTab, upsertTransferItem]);
+
+  const startBatchDownload = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法发起批量下载：Host 不存在。");
+      return;
+    }
+    const checked = checkedRemotePathsByTab[activeTab.tab_id] ?? [];
+    const entriesForTab = remoteEntriesByTab[activeTab.tab_id] ?? [];
+    const targets = entriesForTab.filter(
+      (entry) => checked.includes(entry.path) && entry.entry_type !== "dir",
+    );
+    if (targets.length === 0) {
+      setNotice("请先勾选至少一个文件。");
+      return;
+    }
+    const conflictPolicy = askConflictPolicy("rename");
+    if (conflictPolicy === null) {
+      setNotice("已取消批量下载。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      for (const entry of targets) {
+        const response = await invoke<TransferStartResponse>("transfer_download", {
+          input: {
+            hostId: host.host_id,
+            remotePath: entry.path,
+            localPath: null,
+            password,
+            conflictPolicy,
+          },
+        });
+        upsertTransferItem({
+          transfer_id: response.transfer_id,
+          direction: "download",
+          host_alias: host.alias,
+          target_path: entry.path,
+          state: "queued",
+          done_bytes: 0,
+          total_bytes: null,
+          message: response.resolved_local_path ?? "下载任务已创建",
+        });
+      }
+      setNotice(`批量下载任务已创建：${targets.length} 个文件。`);
+    } catch (error: unknown) {
+      setNotice(`批量下载失败：${formatInvokeError(error)}`);
+    } finally {
+      setTransferBusy(false);
+    }
+  }, [activeTab, checkedRemotePathsByTab, hostById, remoteEntriesByTab, requestPasswordForHost, upsertTransferItem]);
 
   const startUpload = useCallback(async () => {
     if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
@@ -724,6 +821,11 @@ export function HostsWorkspace() {
       setNotice("远端路径不能为空。");
       return;
     }
+    const conflictPolicy = askConflictPolicy("rename");
+    if (conflictPolicy === null) {
+      setNotice("已取消上传。");
+      return;
+    }
     const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
     if (host.auth_mode === "password" && password === null) {
       return;
@@ -736,6 +838,7 @@ export function HostsWorkspace() {
           localPath: localPath.trim(),
           remotePath: remotePath.trim(),
           password,
+          conflictPolicy,
         },
       });
       upsertTransferItem({
@@ -746,6 +849,7 @@ export function HostsWorkspace() {
         state: "queued",
         done_bytes: 0,
         total_bytes: null,
+        message: response.resolved_remote_path ? `目标：${response.resolved_remote_path}` : undefined,
       });
       setNotice("上传任务已创建。");
     } catch (error: unknown) {
@@ -768,6 +872,27 @@ export function HostsWorkspace() {
     }
   }, []);
 
+  const verifyTransferSha256 = useCallback(async (transferId: string) => {
+    try {
+      const response = await invoke<TransferVerifyResponse>("transfer_verify_sha256", { transferId });
+      if (response.ok) {
+        upsertTransferItem({
+          transfer_id: transferId,
+          sha256: response.sha256 ?? undefined,
+          message: response.sha256 ? `SHA256: ${response.sha256}` : "SHA256 校验完成",
+        });
+        setNotice("SHA256 校验完成。");
+      }
+    } catch (error: unknown) {
+      const errorMessage = `SHA256 校验失败：${formatInvokeError(error)}`;
+      upsertTransferItem({
+        transfer_id: transferId,
+        message: errorMessage,
+      });
+      setNotice(errorMessage);
+    }
+  }, [upsertTransferItem]);
+
   useEffect(() => {
     if (tabs.length === 0) {
       void createNewTab();
@@ -786,6 +911,7 @@ export function HostsWorkspace() {
     let unlistenOutput: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
     let unlistenTransfer: (() => void) | undefined;
+    let unlistenVerify: (() => void) | undefined;
 
     const bind = async () => {
       try {
@@ -822,6 +948,17 @@ export function HostsWorkspace() {
             void refreshActiveRemoteFiles();
           }
         });
+        unlistenVerify = await listen<TransferVerifyPayload>("transfer.verify", (event) => {
+          const payload = event.payload;
+          upsertTransferItem({
+            transfer_id: payload.transfer_id,
+            sha256: payload.sha256 ?? undefined,
+            message: payload.message ?? undefined,
+          });
+          if (payload.message && (payload.state === "done" || payload.state === "error")) {
+            setNotice(payload.message);
+          }
+        });
       } catch {
         setNotice("当前不是 Tauri 运行时，终端命令不可用。");
       }
@@ -837,6 +974,9 @@ export function HostsWorkspace() {
       }
       if (unlistenTransfer) {
         unlistenTransfer();
+      }
+      if (unlistenVerify) {
+        unlistenVerify();
       }
     };
   }, [refreshActiveRemoteFiles, updatePaneStatus, upsertTransferItem]);
@@ -912,6 +1052,12 @@ export function HostsWorkspace() {
       );
       return Object.keys(next).length === Object.keys(prev).length ? prev : next;
     });
+    setCheckedRemotePathsByTab((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([tabId]) => validTabIds.has(tabId)),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
   }, [tabs]);
 
   const filteredHistory = useMemo(() => {
@@ -921,10 +1067,29 @@ export function HostsWorkspace() {
     }
     return history.filter((line) => line.toLowerCase().includes(keyword));
   }, [history, historyKeyword]);
-  const activeRemoteEntries = activeTab ? remoteEntriesByTab[activeTab.tab_id] ?? [] : [];
+  const activeRemoteEntries = activeTab
+    ? remoteEntriesByTab[activeTab.tab_id] ?? EMPTY_REMOTE_ENTRIES
+    : EMPTY_REMOTE_ENTRIES;
   const activeRemoteCwd = activeTab ? remoteCwdByTab[activeTab.tab_id] ?? "-" : "-";
   const activeRemotePathInput = activeTab ? remotePathInputByTab[activeTab.tab_id] ?? "" : "";
   const activeSelectedRemotePath = activeTab ? selectedRemotePathByTab[activeTab.tab_id] ?? "" : "";
+  const activeCheckedRemotePaths = activeTab
+    ? checkedRemotePathsByTab[activeTab.tab_id] ?? EMPTY_PATHS
+    : EMPTY_PATHS;
+  const activeDownloadableEntries = useMemo(
+    () => activeRemoteEntries.filter((entry) => entry.entry_type !== "dir"),
+    [activeRemoteEntries],
+  );
+  const activeCheckedDownloadCount = useMemo(
+    () =>
+      activeDownloadableEntries.filter((entry) =>
+        activeCheckedRemotePaths.includes(entry.path),
+      ).length,
+    [activeCheckedRemotePaths, activeDownloadableEntries],
+  );
+  const allDownloadableChecked =
+    activeDownloadableEntries.length > 0 &&
+    activeCheckedDownloadCount === activeDownloadableEntries.length;
 
   return (
     <section className="hosts-workspace">
@@ -1176,6 +1341,17 @@ export function HostsWorkspace() {
                   >
                     下载
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => void startBatchDownload()}
+                    disabled={
+                      transferBusy ||
+                      remoteLoadingTabId === activeTab.tab_id ||
+                      activeCheckedDownloadCount === 0
+                    }
+                  >
+                    批量下载（{activeCheckedDownloadCount}）
+                  </button>
                 </div>
               ) : null}
             </div>
@@ -1192,6 +1368,24 @@ export function HostsWorkspace() {
                   <table className="filebar-table">
                     <thead>
                       <tr>
+                        <th className="filebar-checkbox-col">
+                          <input
+                            type="checkbox"
+                            checked={allDownloadableChecked}
+                            disabled={activeDownloadableEntries.length === 0}
+                            onChange={(event) => {
+                              if (!activeTab) {
+                                return;
+                              }
+                              setCheckedRemotePathsByTab((prev) => ({
+                                ...prev,
+                                [activeTab.tab_id]: event.currentTarget.checked
+                                  ? activeDownloadableEntries.map((entry) => entry.path)
+                                  : [],
+                              }));
+                            }}
+                          />
+                        </th>
                         <th>名称</th>
                         <th>类型</th>
                         <th>大小</th>
@@ -1222,6 +1416,41 @@ export function HostsWorkspace() {
                             entry.entry_type === "dir" ? void openRemoteDirectory(entry) : undefined
                           }
                         >
+                          <td className="filebar-checkbox-col">
+                            <input
+                              type="checkbox"
+                              checked={
+                                entry.entry_type === "dir"
+                                  ? false
+                                  : activeCheckedRemotePaths.includes(entry.path)
+                              }
+                              disabled={entry.entry_type === "dir"}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={(event) => {
+                                if (!activeTab || entry.entry_type === "dir") {
+                                  return;
+                                }
+                                const shouldCheck = event.currentTarget.checked;
+                                setCheckedRemotePathsByTab((prev) => {
+                                  const current = prev[activeTab.tab_id] ?? [];
+                                  const exists = current.includes(entry.path);
+                                  if (shouldCheck && !exists) {
+                                    return {
+                                      ...prev,
+                                      [activeTab.tab_id]: [...current, entry.path],
+                                    };
+                                  }
+                                  if (!shouldCheck && exists) {
+                                    return {
+                                      ...prev,
+                                      [activeTab.tab_id]: current.filter((path) => path !== entry.path),
+                                    };
+                                  }
+                                  return prev;
+                                });
+                              }}
+                            />
+                          </td>
                           <td>{entry.name}</td>
                           <td>{entry.entry_type}</td>
                           <td>{entry.entry_type === "dir" ? "-" : formatFileSize(entry.size_bytes)}</td>
@@ -1234,7 +1463,7 @@ export function HostsWorkspace() {
                       ))}
                       {activeRemoteEntries.length === 0 && remoteLoadingTabId !== activeTab.tab_id ? (
                         <tr>
-                          <td colSpan={6} className="filebar-empty">
+                          <td colSpan={7} className="filebar-empty">
                             暂无文件或目录
                           </td>
                         </tr>
@@ -1257,12 +1486,20 @@ export function HostsWorkspace() {
                           <span>{item.target_path}</span>
                           <span>{formatTransferProgress(item.done_bytes, item.total_bytes)}</span>
                           {item.message ? <span>{item.message}</span> : null}
+                          {item.sha256 ? <span>SHA256: {item.sha256}</span> : null}
                         </div>
-                        {(item.state === "queued" || item.state === "running") && (
-                          <button type="button" onClick={() => void cancelTransfer(item.transfer_id)}>
-                            取消
-                          </button>
-                        )}
+                        <div className="transfer-actions">
+                          {(item.state === "queued" || item.state === "running") && (
+                            <button type="button" onClick={() => void cancelTransfer(item.transfer_id)}>
+                              取消
+                            </button>
+                          )}
+                          {item.direction === "download" && item.state === "done" && (
+                            <button type="button" onClick={() => void verifyTransferSha256(item.transfer_id)}>
+                              校验SHA256
+                            </button>
+                          )}
+                        </div>
                       </li>
                     ))}
                     {transferItems.length === 0 ? <li className="transfer-empty">暂无传输任务</li> : null}

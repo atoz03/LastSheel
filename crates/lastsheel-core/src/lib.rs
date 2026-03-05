@@ -205,6 +205,7 @@ pub struct TransferUpdateEventDto {
 pub struct TransferStartDto {
     pub transfer_id: String,
     pub resolved_local_path: Option<String>,
+    pub resolved_remote_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +214,7 @@ pub struct TransferDownloadInputDto {
     pub remote_path: String,
     pub local_path: Option<String>,
     pub password: Option<String>,
+    pub conflict_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,4 +223,27 @@ pub struct TransferUploadInputDto {
     pub local_path: String,
     pub remote_path: String,
     pub password: Option<String>,
+    pub conflict_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferVerifyResultDto {
+    pub ok: bool,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferVerifyState {
+    Running,
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferVerifyEventDto {
+    pub transfer_id: String,
+    pub state: TransferVerifyState,
+    pub sha256: Option<String>,
+    pub message: Option<String>,
 }

@@ -65,4 +65,19 @@ export type TransferUpdatePayload = {
 export type TransferStartResponse = {
   transfer_id: string;
   resolved_local_path?: string | null;
+  resolved_remote_path?: string | null;
+};
+
+export type TransferVerifyResponse = {
+  ok: boolean;
+  sha256?: string | null;
+};
+
+export type TransferVerifyState = "running" | "done" | "error";
+
+export type TransferVerifyPayload = {
+  transfer_id: string;
+  state: TransferVerifyState;
+  sha256?: string | null;
+  message?: string | null;
 };
