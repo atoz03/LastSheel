@@ -7,7 +7,8 @@ use lastsheel_core::{
     AppBootstrapDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType, FsListResponseDto,
     HostItemDto, HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
     TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
-    VaultStatusDto,
+    TransferDownloadInputDto, TransferStartDto, TransferState, TransferUpdateEventDto,
+    TransferUploadInputDto, VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -21,6 +22,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
@@ -51,6 +54,15 @@ struct KnownHostsStoreManager {
 #[derive(Default)]
 struct VaultManager {
     runtime: Mutex<VaultRuntime>,
+}
+
+struct TransferControl {
+    canceled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct TransferManager {
+    items: Mutex<HashMap<String, TransferControl>>,
 }
 
 #[derive(Default)]
@@ -105,6 +117,26 @@ fn emit_terminal_status(
         TerminalStatusEventDto {
             terminal_id: terminal_id.to_string(),
             state,
+            message,
+        },
+    );
+}
+
+fn emit_transfer_update(
+    app: &tauri::AppHandle,
+    transfer_id: &str,
+    state: TransferState,
+    done_bytes: u64,
+    total_bytes: Option<u64>,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        "transfer.update",
+        TransferUpdateEventDto {
+            transfer_id: transfer_id.to_string(),
+            state,
+            done_bytes,
+            total_bytes,
             message,
         },
     );
@@ -628,7 +660,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
-        "文件栏 SFTP 目录列表（阶段1）".to_string(),
+        "文件栏 SFTP 目录列表 + 传输队列（阶段2）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -968,67 +1000,101 @@ fn load_private_key_for_auth(
     Ok((key.pem_text.clone(), key.passphrase.clone()))
 }
 
-fn authenticate_sftp_session(
-    session: &mut ssh2::Session,
+#[derive(Clone, Default)]
+struct PreparedSshAuth {
+    auth_mode: String,
+    key_pem: Option<String>,
+    key_passphrase: Option<String>,
+    password: Option<String>,
+}
+
+fn prepare_sftp_auth(
     host: &HostItemDto,
     auth_mode: &str,
     password: Option<String>,
     vault_manager: &State<VaultManager>,
+) -> Result<PreparedSshAuth, ErrorDto> {
+    let mut prepared = PreparedSshAuth {
+        auth_mode: auth_mode.to_string(),
+        key_pem: None,
+        key_passphrase: None,
+        password,
+    };
+    if auth_mode == "key" {
+        let key_id = host
+            .key_id
+            .as_ref()
+            .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "当前 Host 未配置密钥"))?;
+        let (pem_text, passphrase) = load_private_key_for_auth(vault_manager, key_id)?;
+        prepared.key_pem = Some(pem_text);
+        prepared.key_passphrase = passphrase;
+        return Ok(prepared);
+    }
+    if auth_mode == "auto" {
+        if let Some(key_id) = &host.key_id {
+            if let Ok((pem_text, passphrase)) = load_private_key_for_auth(vault_manager, key_id) {
+                prepared.key_pem = Some(pem_text);
+                prepared.key_passphrase = passphrase;
+            }
+        }
+        return Ok(prepared);
+    }
+    Ok(prepared)
+}
+
+fn authenticate_sftp_session(
+    session: &mut ssh2::Session,
+    username: &str,
+    prepared_auth: &PreparedSshAuth,
 ) -> Result<(), ErrorDto> {
-    match auth_mode {
+    match prepared_auth.auth_mode.as_str() {
         "key" => {
-            let key_id = host
-                .key_id
-                .as_ref()
+            let pem_text = prepared_auth
+                .key_pem
+                .as_deref()
                 .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "当前 Host 未配置密钥"))?;
-            let (pem_text, passphrase) = load_private_key_for_auth(vault_manager, key_id)?;
             session
                 .userauth_pubkey_memory(
-                    &host.username,
+                    username,
                     None,
-                    pem_text.as_str(),
-                    passphrase.as_deref(),
+                    pem_text,
+                    prepared_auth.key_passphrase.as_deref(),
                 )
                 .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "密钥认证失败"))?;
         }
         "password" => {
-            let plain = password.ok_or_else(|| {
+            let plain = prepared_auth.password.as_ref().ok_or_else(|| {
                 ErrorDto::new(ErrorCode::AuthFailed, "密码认证需要输入一次性密码")
             })?;
             session
-                .userauth_password(&host.username, plain.as_str())
+                .userauth_password(username, plain.as_str())
                 .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "密码认证失败"))?;
         }
         "agent" => {
             session
-                .userauth_agent(&host.username)
+                .userauth_agent(username)
                 .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "Agent 认证失败"))?;
         }
         _ => {
-            if let Some(key_id) = &host.key_id {
-                if let Ok((pem_text, passphrase)) = load_private_key_for_auth(vault_manager, key_id)
+            if let Some(pem_text) = prepared_auth.key_pem.as_deref() {
+                if session
+                    .userauth_pubkey_memory(
+                        username,
+                        None,
+                        pem_text,
+                        prepared_auth.key_passphrase.as_deref(),
+                    )
+                    .is_ok()
+                    && session.authenticated()
                 {
-                    if session
-                        .userauth_pubkey_memory(
-                            &host.username,
-                            None,
-                            pem_text.as_str(),
-                            passphrase.as_deref(),
-                        )
-                        .is_ok()
-                        && session.authenticated()
-                    {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
             }
-            if session.userauth_agent(&host.username).is_ok() && session.authenticated() {
+            if session.userauth_agent(username).is_ok() && session.authenticated() {
                 return Ok(());
             }
-            if let Some(plain) = password {
-                if session
-                    .userauth_password(&host.username, plain.as_str())
-                    .is_ok()
+            if let Some(plain) = prepared_auth.password.as_ref() {
+                if session.userauth_password(username, plain.as_str()).is_ok()
                     && session.authenticated()
                 {
                     return Ok(());
@@ -1045,6 +1111,24 @@ fn authenticate_sftp_session(
         return Err(ErrorDto::new(ErrorCode::AuthFailed, "SSH 认证失败"));
     }
     Ok(())
+}
+
+fn open_authenticated_sftp(
+    host: &HostItemDto,
+    prepared_auth: &PreparedSshAuth,
+) -> Result<ssh2::Sftp, ErrorDto> {
+    let tcp = TcpStream::connect((host.address.as_str(), host.port))
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "连接远端 SSH 端口失败"))?;
+    let mut session =
+        ssh2::Session::new().map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建 SSH 会话失败"))?;
+    session.set_tcp_stream(tcp);
+    session
+        .handshake()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
+    authenticate_sftp_session(&mut session, &host.username, prepared_auth)?;
+    session
+        .sftp()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "初始化 SFTP 通道失败"))
 }
 
 fn entry_type_from_perm(mode: u32) -> FileEntryType {
@@ -1135,26 +1219,9 @@ fn fs_list_remote(
 
     let auth_mode = normalize_auth_mode(&host.auth_mode);
     let one_time_password = prepare_one_time_password(&auth_mode, password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
     ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
-
-    let tcp = TcpStream::connect((host.address.as_str(), host.port))
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "连接远端 SSH 端口失败"))?;
-    let mut session =
-        ssh2::Session::new().map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建 SSH 会话失败"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
-    authenticate_sftp_session(
-        &mut session,
-        &host,
-        &auth_mode,
-        one_time_password,
-        &vault_manager,
-    )?;
-    let sftp = session
-        .sftp()
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "初始化 SFTP 通道失败"))?;
+    let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
     let requested_path = path
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1167,6 +1234,388 @@ fn fs_list_remote(
         cwd: path_to_string(&cwd_path),
         entries,
     })
+}
+
+fn load_host_for_remote_operation(
+    app: &tauri::AppHandle,
+    hosts_manager: &State<HostsStoreManager>,
+    host_id: &str,
+) -> Result<HostItemDto, ErrorDto> {
+    let _hosts_guard = hosts_manager.lock.lock();
+    let hosts = load_hosts_from_disk(app)?;
+    hosts
+        .items
+        .iter()
+        .find(|item| item.host_id == host_id)
+        .cloned()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))
+}
+
+fn sanitize_path_segment(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "host".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn resolve_conflict_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or("download")
+        .to_string();
+    let ext = path
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("");
+    for index in 1..10000 {
+        let file_name = if ext.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{ext}")
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{stem}-{}", Uuid::new_v4()))
+}
+
+fn resolve_download_target_path(
+    app: &tauri::AppHandle,
+    host: &HostItemDto,
+    remote_path: &str,
+    local_path: Option<String>,
+) -> Result<PathBuf, ErrorDto> {
+    let candidate = local_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let base = app.path().download_dir().unwrap_or_else(|_| {
+                app.path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
+            let file_name = Path::new(remote_path)
+                .file_name()
+                .and_then(|item| item.to_str())
+                .filter(|item| !item.is_empty())
+                .unwrap_or("download.bin")
+                .to_string();
+            base.join("LastSheel")
+                .join(sanitize_path_segment(&host.alias))
+                .join(file_name)
+        });
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "无效的下载路径"))?;
+    fs::create_dir_all(parent)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建下载目录失败"))?;
+    Ok(resolve_conflict_path(candidate))
+}
+
+fn insert_transfer_control(
+    transfer_manager: &State<TransferManager>,
+    transfer_id: &str,
+) -> Arc<AtomicBool> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    transfer_manager.items.lock().insert(
+        transfer_id.to_string(),
+        TransferControl {
+            canceled: canceled.clone(),
+        },
+    );
+    canceled
+}
+
+fn remove_transfer_control(app: &tauri::AppHandle, transfer_id: &str) {
+    let transfer_manager = app.state::<TransferManager>();
+    transfer_manager.items.lock().remove(transfer_id);
+}
+
+#[tauri::command]
+fn transfer_download(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    transfer_manager: State<TransferManager>,
+    input: TransferDownloadInputDto,
+) -> Result<TransferStartDto, ErrorDto> {
+    let remote_path = input.remote_path.trim().to_string();
+    if remote_path.is_empty() {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "远端路径不能为空"));
+    }
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "传输当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+    let resolved_local_path =
+        resolve_download_target_path(&app, &host, &remote_path, input.local_path)?;
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
+    emit_transfer_update(
+        &app,
+        &transfer_id,
+        TransferState::Queued,
+        0,
+        None,
+        Some("下载任务已入队".to_string()),
+    );
+
+    let app_handle = app.clone();
+    let transfer_id_for_thread = transfer_id.clone();
+    let resolved_local_path_for_thread = resolved_local_path.clone();
+    thread::spawn(move || {
+        emit_transfer_update(
+            &app_handle,
+            &transfer_id_for_thread,
+            TransferState::Running,
+            0,
+            None,
+            Some("开始下载".to_string()),
+        );
+        let run_result = (|| -> Result<(u64, Option<u64>), ErrorDto> {
+            let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+            let mut remote_file = sftp
+                .open(Path::new(&remote_path))
+                .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "远端文件不存在或不可读"))?;
+            let total_bytes = sftp
+                .stat(Path::new(&remote_path))
+                .ok()
+                .and_then(|stat| stat.size);
+            let mut local_file = fs::File::create(&resolved_local_path_for_thread)
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建本地文件失败"))?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut done_bytes = 0_u64;
+            loop {
+                if canceled.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&resolved_local_path_for_thread);
+                    return Err(ErrorDto::new(ErrorCode::Canceled, "下载已取消"));
+                }
+                let read_size = remote_file
+                    .read(&mut buffer)
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端文件失败"))?;
+                if read_size == 0 {
+                    break;
+                }
+                local_file
+                    .write_all(&buffer[..read_size])
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "写入本地文件失败"))?;
+                done_bytes = done_bytes.saturating_add(read_size as u64);
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Running,
+                    done_bytes,
+                    total_bytes,
+                    None,
+                );
+            }
+            Ok((done_bytes, total_bytes))
+        })();
+
+        match run_result {
+            Ok((done_bytes, total_bytes)) => emit_transfer_update(
+                &app_handle,
+                &transfer_id_for_thread,
+                TransferState::Done,
+                done_bytes,
+                total_bytes,
+                Some(format!(
+                    "下载完成：{}",
+                    path_to_string(&resolved_local_path_for_thread)
+                )),
+            ),
+            Err(error) => {
+                let state = if matches!(error.code, ErrorCode::Canceled) {
+                    TransferState::Canceled
+                } else {
+                    TransferState::Error
+                };
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    state,
+                    0,
+                    None,
+                    Some(error.message),
+                );
+            }
+        }
+        remove_transfer_control(&app_handle, &transfer_id_for_thread);
+    });
+
+    Ok(TransferStartDto {
+        transfer_id,
+        resolved_local_path: Some(path_to_string(&resolved_local_path)),
+    })
+}
+
+#[tauri::command]
+fn transfer_upload(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    transfer_manager: State<TransferManager>,
+    input: TransferUploadInputDto,
+) -> Result<TransferStartDto, ErrorDto> {
+    let local_path = input.local_path.trim().to_string();
+    let remote_path = input.remote_path.trim().to_string();
+    if local_path.is_empty() || remote_path.is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "本地路径和远端路径不能为空",
+        ));
+    }
+    let local_path_buf = PathBuf::from(local_path.clone());
+    if !local_path_buf.exists() {
+        return Err(ErrorDto::new(ErrorCode::NotFound, "本地文件不存在"));
+    }
+
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "传输当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
+    emit_transfer_update(
+        &app,
+        &transfer_id,
+        TransferState::Queued,
+        0,
+        None,
+        Some("上传任务已入队".to_string()),
+    );
+
+    let app_handle = app.clone();
+    let transfer_id_for_thread = transfer_id.clone();
+    thread::spawn(move || {
+        emit_transfer_update(
+            &app_handle,
+            &transfer_id_for_thread,
+            TransferState::Running,
+            0,
+            None,
+            Some("开始上传".to_string()),
+        );
+        let run_result = (|| -> Result<(u64, Option<u64>), ErrorDto> {
+            let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+            let mut local_file = fs::File::open(&local_path_buf)
+                .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "读取本地文件失败"))?;
+            let total_bytes = local_file.metadata().ok().map(|meta| meta.len());
+            let mut remote_file = sftp
+                .create(Path::new(&remote_path))
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端文件失败"))?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut done_bytes = 0_u64;
+            loop {
+                if canceled.load(Ordering::Relaxed) {
+                    let _ = sftp.unlink(Path::new(&remote_path));
+                    return Err(ErrorDto::new(ErrorCode::Canceled, "上传已取消"));
+                }
+                let read_size = local_file
+                    .read(&mut buffer)
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取本地文件失败"))?;
+                if read_size == 0 {
+                    break;
+                }
+                remote_file
+                    .write_all(&buffer[..read_size])
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "写入远端文件失败"))?;
+                done_bytes = done_bytes.saturating_add(read_size as u64);
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Running,
+                    done_bytes,
+                    total_bytes,
+                    None,
+                );
+            }
+            Ok((done_bytes, total_bytes))
+        })();
+
+        match run_result {
+            Ok((done_bytes, total_bytes)) => emit_transfer_update(
+                &app_handle,
+                &transfer_id_for_thread,
+                TransferState::Done,
+                done_bytes,
+                total_bytes,
+                Some("上传完成".to_string()),
+            ),
+            Err(error) => {
+                let state = if matches!(error.code, ErrorCode::Canceled) {
+                    TransferState::Canceled
+                } else {
+                    TransferState::Error
+                };
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    state,
+                    0,
+                    None,
+                    Some(error.message),
+                );
+            }
+        }
+        remove_transfer_control(&app_handle, &transfer_id_for_thread);
+    });
+
+    Ok(TransferStartDto {
+        transfer_id,
+        resolved_local_path: None,
+    })
+}
+
+#[tauri::command]
+fn transfer_cancel(
+    transfer_manager: State<TransferManager>,
+    transfer_id: String,
+) -> Result<(), ErrorDto> {
+    let items = transfer_manager.items.lock();
+    let control = items
+        .get(&transfer_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "传输任务不存在"))?;
+    control.canceled.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 fn spawn_terminal_with_command(
@@ -1466,6 +1915,7 @@ pub fn run() {
         .manage(HostsStoreManager::default())
         .manage(KnownHostsStoreManager::default())
         .manage(VaultManager::default())
+        .manage(TransferManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             app_get_bootstrap,
@@ -1480,6 +1930,9 @@ pub fn run() {
             key_import_private_key,
             key_list,
             fs_list_remote,
+            transfer_download,
+            transfer_upload,
+            transfer_cancel,
             terminal_spawn_local,
             terminal_connect_ssh,
             terminal_write,

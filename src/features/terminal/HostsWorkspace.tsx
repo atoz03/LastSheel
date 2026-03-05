@@ -12,6 +12,9 @@ import type {
   TerminalSessionResponse,
   TerminalStatusPayload,
   TerminalTabModel,
+  TransferStartResponse,
+  TransferState,
+  TransferUpdatePayload,
 } from "./types";
 import "./hosts-workspace.css";
 
@@ -61,6 +64,17 @@ type HostForm = {
 
 type InvokeErrorDto = {
   code?: string;
+  message?: string;
+};
+
+type TransferItem = {
+  transfer_id: string;
+  direction: "download" | "upload";
+  host_alias: string;
+  target_path: string;
+  state: TransferState;
+  done_bytes: number;
+  total_bytes?: number | null;
   message?: string;
 };
 
@@ -131,6 +145,14 @@ function formatMtime(timestampMs: number): string {
   return new Date(timestampMs).toLocaleString();
 }
 
+function formatTransferProgress(doneBytes: number, totalBytes?: number | null): string {
+  if (totalBytes && totalBytes > 0) {
+    const pct = Math.min(100, (doneBytes / totalBytes) * 100);
+    return `${formatFileSize(doneBytes)} / ${formatFileSize(totalBytes)} (${pct.toFixed(1)}%)`;
+  }
+  return formatFileSize(doneBytes);
+}
+
 function createTab(
   title: string,
   pane: TerminalPaneModel,
@@ -173,6 +195,9 @@ export function HostsWorkspace() {
   const [remoteCwdByTab, setRemoteCwdByTab] = useState<Record<string, string>>({});
   const [remotePathInputByTab, setRemotePathInputByTab] = useState<Record<string, string>>({});
   const [remoteLoadingTabId, setRemoteLoadingTabId] = useState<string | null>(null);
+  const [selectedRemotePathByTab, setSelectedRemotePathByTab] = useState<Record<string, string>>({});
+  const [transferItems, setTransferItems] = useState<TransferItem[]>([]);
+  const [transferBusy, setTransferBusy] = useState(false);
   const inputBufferRef = useRef<Record<string, string>>({});
   const tabsRef = useRef<TerminalTabModel[]>([]);
   const passwordCacheRef = useRef<Record<string, string>>({});
@@ -549,6 +574,13 @@ export function HostsWorkspace() {
         setRemoteEntriesByTab((prev) => ({ ...prev, [tab.tab_id]: response.entries }));
         setRemoteCwdByTab((prev) => ({ ...prev, [tab.tab_id]: response.cwd }));
         setRemotePathInputByTab((prev) => ({ ...prev, [tab.tab_id]: response.cwd }));
+        setSelectedRemotePathByTab((prev) => {
+          const selected = prev[tab.tab_id];
+          if (selected && response.entries.some((entry) => entry.path === selected)) {
+            return prev;
+          }
+          return { ...prev, [tab.tab_id]: "" };
+        });
       } catch (error: unknown) {
         const payload = getInvokeError(error);
         if (payload.code === "AUTH_FAILED") {
@@ -580,6 +612,162 @@ export function HostsWorkspace() {
     [activeTab, loadRemoteFilesForTab],
   );
 
+  const upsertTransferItem = useCallback((nextItem: { transfer_id: string } & Partial<TransferItem>) => {
+    setTransferItems((prev) => {
+      const existingIndex = prev.findIndex((item) => item.transfer_id === nextItem.transfer_id);
+      if (existingIndex < 0) {
+        const created: TransferItem = {
+          transfer_id: nextItem.transfer_id,
+          direction: nextItem.direction ?? "download",
+          host_alias: nextItem.host_alias ?? "-",
+          target_path: nextItem.target_path ?? "-",
+          state: nextItem.state ?? "queued",
+          done_bytes: nextItem.done_bytes ?? 0,
+          total_bytes: nextItem.total_bytes ?? null,
+          message: nextItem.message,
+        };
+        return [created, ...prev].slice(0, 20);
+      }
+      const next = [...prev];
+      next[existingIndex] = { ...next[existingIndex], ...nextItem };
+      return next;
+    });
+  }, []);
+
+  const startDownload = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法发起下载：Host 不存在。");
+      return;
+    }
+    const remotePath = selectedRemotePathByTab[activeTab.tab_id];
+    if (!remotePath) {
+      setNotice("请先在文件列表中选中要下载的文件。");
+      return;
+    }
+    const entriesForTab = remoteEntriesByTab[activeTab.tab_id] ?? [];
+    const remoteEntry = entriesForTab.find((item) => item.path === remotePath);
+    if (!remoteEntry || remoteEntry.entry_type === "dir") {
+      setNotice("目录不支持直接下载，请选择文件。");
+      return;
+    }
+    const customLocalPath = window.prompt("可选：输入本地保存路径（留空则使用默认下载目录）", "");
+    if (customLocalPath === null) {
+      setNotice("已取消下载。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      const response = await invoke<TransferStartResponse>("transfer_download", {
+        input: {
+          hostId: host.host_id,
+          remotePath: remoteEntry.path,
+          localPath: customLocalPath.trim() ? customLocalPath.trim() : null,
+          password,
+        },
+      });
+      upsertTransferItem({
+        transfer_id: response.transfer_id,
+        direction: "download",
+        host_alias: host.alias,
+        target_path: remoteEntry.path,
+        state: "queued",
+        done_bytes: 0,
+        total_bytes: null,
+        message: response.resolved_local_path ?? "下载任务已创建",
+      });
+      setNotice("下载任务已创建。");
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`下载失败：${formatInvokeError(error)}`);
+    } finally {
+      setTransferBusy(false);
+    }
+  }, [activeTab, hostById, remoteEntriesByTab, requestPasswordForHost, selectedRemotePathByTab, upsertTransferItem]);
+
+  const startUpload = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法发起上传：Host 不存在。");
+      return;
+    }
+    const localPath = window.prompt("请输入本地文件绝对路径", "");
+    if (localPath === null) {
+      setNotice("已取消上传。");
+      return;
+    }
+    if (!localPath.trim()) {
+      setNotice("本地路径不能为空。");
+      return;
+    }
+    const currentCwd = remoteCwdByTab[activeTab.tab_id] ?? "-";
+    const defaultRemote = currentCwd !== "-" ? `${currentCwd}/` : "";
+    const remotePath = window.prompt("请输入远端目标文件路径", defaultRemote);
+    if (remotePath === null) {
+      setNotice("已取消上传。");
+      return;
+    }
+    if (!remotePath.trim()) {
+      setNotice("远端路径不能为空。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      const response = await invoke<TransferStartResponse>("transfer_upload", {
+        input: {
+          hostId: host.host_id,
+          localPath: localPath.trim(),
+          remotePath: remotePath.trim(),
+          password,
+        },
+      });
+      upsertTransferItem({
+        transfer_id: response.transfer_id,
+        direction: "upload",
+        host_alias: host.alias,
+        target_path: remotePath.trim(),
+        state: "queued",
+        done_bytes: 0,
+        total_bytes: null,
+      });
+      setNotice("上传任务已创建。");
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`上传失败：${formatInvokeError(error)}`);
+    } finally {
+      setTransferBusy(false);
+    }
+  }, [activeTab, hostById, remoteCwdByTab, requestPasswordForHost, upsertTransferItem]);
+
+  const cancelTransfer = useCallback(async (transferId: string) => {
+    try {
+      await invoke("transfer_cancel", { transferId });
+      setNotice("已发送取消请求。");
+    } catch (error: unknown) {
+      setNotice(`取消失败：${formatInvokeError(error)}`);
+    }
+  }, []);
+
   useEffect(() => {
     if (tabs.length === 0) {
       void createNewTab();
@@ -597,6 +785,7 @@ export function HostsWorkspace() {
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
+    let unlistenTransfer: (() => void) | undefined;
 
     const bind = async () => {
       try {
@@ -617,6 +806,22 @@ export function HostsWorkspace() {
             setNotice(payload.message);
           }
         });
+        unlistenTransfer = await listen<TransferUpdatePayload>("transfer.update", (event) => {
+          const payload = event.payload;
+          upsertTransferItem({
+            transfer_id: payload.transfer_id,
+            state: payload.state,
+            done_bytes: payload.done_bytes,
+            total_bytes: payload.total_bytes,
+            message: payload.message ?? undefined,
+          });
+          if (payload.message && (payload.state === "done" || payload.state === "error")) {
+            setNotice(payload.message);
+          }
+          if (payload.state === "done" || payload.state === "error" || payload.state === "canceled") {
+            void refreshActiveRemoteFiles();
+          }
+        });
       } catch {
         setNotice("当前不是 Tauri 运行时，终端命令不可用。");
       }
@@ -630,8 +835,11 @@ export function HostsWorkspace() {
       if (unlistenStatus) {
         unlistenStatus();
       }
+      if (unlistenTransfer) {
+        unlistenTransfer();
+      }
     };
-  }, [updatePaneStatus]);
+  }, [refreshActiveRemoteFiles, updatePaneStatus, upsertTransferItem]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -698,6 +906,12 @@ export function HostsWorkspace() {
       );
       return Object.keys(next).length === Object.keys(prev).length ? prev : next;
     });
+    setSelectedRemotePathByTab((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([tabId]) => validTabIds.has(tabId)),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
   }, [tabs]);
 
   const filteredHistory = useMemo(() => {
@@ -710,6 +924,7 @@ export function HostsWorkspace() {
   const activeRemoteEntries = activeTab ? remoteEntriesByTab[activeTab.tab_id] ?? [] : [];
   const activeRemoteCwd = activeTab ? remoteCwdByTab[activeTab.tab_id] ?? "-" : "-";
   const activeRemotePathInput = activeTab ? remotePathInputByTab[activeTab.tab_id] ?? "" : "";
+  const activeSelectedRemotePath = activeTab ? selectedRemotePathByTab[activeTab.tab_id] ?? "" : "";
 
   return (
     <section className="hosts-workspace">
@@ -941,6 +1156,26 @@ export function HostsWorkspace() {
                   <button type="button" onClick={() => void refreshActiveRemoteFiles()}>
                     {remoteLoadingTabId === activeTab.tab_id ? "加载中..." : "刷新"}
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => void startUpload()}
+                    disabled={transferBusy || remoteLoadingTabId === activeTab.tab_id}
+                  >
+                    上传
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void startDownload()}
+                    disabled={
+                      transferBusy ||
+                      remoteLoadingTabId === activeTab.tab_id ||
+                      !activeSelectedRemotePath ||
+                      activeRemoteEntries.find((item) => item.path === activeSelectedRemotePath)?.entry_type ===
+                        "dir"
+                    }
+                  >
+                    下载
+                  </button>
                 </div>
               ) : null}
             </div>
@@ -969,7 +1204,20 @@ export function HostsWorkspace() {
                       {activeRemoteEntries.map((entry) => (
                         <tr
                           key={entry.path}
-                          className={entry.entry_type === "dir" ? "file-row-dir" : undefined}
+                          className={[
+                            entry.entry_type === "dir" ? "file-row-dir" : "",
+                            activeSelectedRemotePath === entry.path ? "file-row-selected" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          onClick={() =>
+                            activeTab
+                              ? setSelectedRemotePathByTab((prev) => ({
+                                  ...prev,
+                                  [activeTab.tab_id]: entry.path,
+                                }))
+                              : undefined
+                          }
                           onDoubleClick={() =>
                             entry.entry_type === "dir" ? void openRemoteDirectory(entry) : undefined
                           }
@@ -993,6 +1241,32 @@ export function HostsWorkspace() {
                       ) : null}
                     </tbody>
                   </table>
+                </div>
+                <div className="transfer-panel">
+                  <h5>传输队列</h5>
+                  <ul className="transfer-list">
+                    {transferItems.map((item) => (
+                      <li key={item.transfer_id}>
+                        <div>
+                          <strong>{item.direction === "download" ? "下载" : "上传"}</strong>
+                          <span>
+                            {item.host_alias} · {item.state}
+                          </span>
+                        </div>
+                        <div>
+                          <span>{item.target_path}</span>
+                          <span>{formatTransferProgress(item.done_bytes, item.total_bytes)}</span>
+                          {item.message ? <span>{item.message}</span> : null}
+                        </div>
+                        {(item.state === "queued" || item.state === "running") && (
+                          <button type="button" onClick={() => void cancelTransfer(item.transfer_id)}>
+                            取消
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                    {transferItems.length === 0 ? <li className="transfer-empty">暂无传输任务</li> : null}
+                  </ul>
                 </div>
               </>
             )}

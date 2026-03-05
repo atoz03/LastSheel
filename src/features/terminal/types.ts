@@ -51,3 +51,18 @@ export type RemoteFileListResponse = {
   cwd: string;
   entries: RemoteFileEntry[];
 };
+
+export type TransferState = "queued" | "running" | "done" | "error" | "canceled";
+
+export type TransferUpdatePayload = {
+  transfer_id: string;
+  state: TransferState;
+  done_bytes: number;
+  total_bytes?: number | null;
+  message?: string | null;
+};
+
+export type TransferStartResponse = {
+  transfer_id: string;
+  resolved_local_path?: string | null;
+};

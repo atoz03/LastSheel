@@ -51,7 +51,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M5-文件栏(阶段1)".to_string(),
+            active_milestone: "M5-文件栏(阶段2)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -180,4 +180,45 @@ pub struct FileEntryDto {
 pub struct FsListResponseDto {
     pub cwd: String,
     pub entries: Vec<FileEntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    Queued,
+    Running,
+    Done,
+    Error,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferUpdateEventDto {
+    pub transfer_id: String,
+    pub state: TransferState,
+    pub done_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferStartDto {
+    pub transfer_id: String,
+    pub resolved_local_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferDownloadInputDto {
+    pub host_id: String,
+    pub remote_path: String,
+    pub local_path: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferUploadInputDto {
+    pub host_id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub password: Option<String>,
 }

@@ -296,6 +296,10 @@
   background: rgba(89, 134, 206, 0.12);
 }
 
+.file-row-selected {
+  background: rgba(106, 165, 255, 0.2);
+}
+
 .file-row-dir {
   cursor: pointer;
 }
@@ -306,6 +310,68 @@
 
 .filebar-empty {
   text-align: center;
+  color: #8ea9d1;
+}
+
+.transfer-panel {
+  border: 1px solid #2a3c60;
+  border-radius: 8px;
+  padding: 8px;
+  background: #0f1b31;
+}
+
+.transfer-panel h5 {
+  margin: 0 0 8px;
+  color: #d8e7ff;
+}
+
+.transfer-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.transfer-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid #23406b;
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: #c8d8f4;
+}
+
+.transfer-list li > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.transfer-list span {
+  color: #9fb4d7;
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 560px;
+}
+
+.transfer-list button {
+  border: 1px solid #40649f;
+  border-radius: 8px;
+  padding: 4px 10px;
+  color: #d7e6ff;
+  background: #152742;
+  cursor: pointer;
+}
+
+.transfer-empty {
+  justify-content: center;
   color: #8ea9d1;
 }
 
