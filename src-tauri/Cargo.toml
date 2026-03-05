@@ -27,3 +27,5 @@ uuid = { version = "1", features = ["v4"] }
 argon2 = "0.5"
 aes-gcm-siv = "0.11"
 rand = "0.8"
+ssh2 = "0.9"
+sha2 = "0.10"

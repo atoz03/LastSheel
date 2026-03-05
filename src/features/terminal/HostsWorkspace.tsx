@@ -30,9 +30,17 @@ type HostItem = {
   address: string;
   port: number;
   username: string;
+  auth_mode: string;
+  key_id?: string | null;
+  proxy_jump: string;
   tags: string[];
   note: string;
   pinned: boolean;
+};
+
+type KeyOption = {
+  key_id: string;
+  name: string;
 };
 
 type HostForm = {
@@ -40,10 +48,31 @@ type HostForm = {
   address: string;
   port: string;
   username: string;
+  authMode: "auto" | "password" | "key" | "agent";
+  keyId: string;
+  proxyJump: string;
   tags: string;
   note: string;
   pinned: boolean;
 };
+
+function formatInvokeError(error: unknown): string {
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") {
+      return message;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return "未知错误";
+    }
+  }
+  return String(error);
+}
 
 function createTab(title: string, pane: TerminalPaneModel): TerminalTabModel {
   const tabId = crypto.randomUUID();
@@ -68,10 +97,14 @@ export function HostsWorkspace() {
     address: "",
     port: "22",
     username: "root",
+    authMode: "auto",
+    keyId: "",
+    proxyJump: "",
     tags: "",
     note: "",
     pinned: false,
   });
+  const [keyOptions, setKeyOptions] = useState<KeyOption[]>([]);
   const inputBufferRef = useRef<Record<string, string>>({});
   const tabsRef = useRef<TerminalTabModel[]>([]);
 
@@ -118,6 +151,15 @@ export function HostsWorkspace() {
     }
   }, []);
 
+  const loadKeyOptions = useCallback(async () => {
+    try {
+      const response = await invoke<KeyOption[]>("key_list");
+      setKeyOptions(response);
+    } catch {
+      setKeyOptions([]);
+    }
+  }, []);
+
   const saveHost = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
@@ -134,6 +176,9 @@ export function HostsWorkspace() {
             address: hostForm.address,
             port: Number.isNaN(port) ? DEFAULT_PORT : port,
             username: hostForm.username,
+            authMode: hostForm.authMode,
+            keyId: hostForm.keyId || null,
+            proxyJump: hostForm.proxyJump,
             tags,
             note: hostForm.note,
             pinned: hostForm.pinned,
@@ -144,6 +189,8 @@ export function HostsWorkspace() {
           ...prev,
           alias: "",
           address: "",
+          keyId: "",
+          proxyJump: "",
           tags: "",
           note: "",
           pinned: false,
@@ -168,6 +215,15 @@ export function HostsWorkspace() {
     },
     [loadHosts],
   );
+
+  const trustHost = useCallback(async (hostId: string) => {
+    try {
+      const result = await invoke<{ fingerprint_sha256: string }>("known_hosts_trust", { hostId });
+      setNotice(`已信任主机指纹：${result.fingerprint_sha256}`);
+    } catch (error: unknown) {
+      setNotice(`信任主机失败：${formatInvokeError(error)}`);
+    }
+  }, []);
 
   const writeTerminal = useCallback(
     async (terminalId: string, data: string) => {
@@ -255,6 +311,27 @@ export function HostsWorkspace() {
     setNotice("已创建本地终端标签。");
   }, [createTerminalPane]);
 
+  const connectSshHost = useCallback(async (host: HostItem) => {
+    try {
+      const response = await invoke<TerminalSessionResponse>("terminal_connect_ssh", {
+        hostId: host.host_id,
+      });
+      const pane: TerminalPaneModel = {
+        pane_id: crypto.randomUUID(),
+        terminal_id: response.terminal_id,
+        status: "connecting",
+      };
+      setTabs((prev) => {
+        const tab = createTab(`SSH:${host.alias}`, pane);
+        setActiveTabId(tab.tab_id);
+        return [...prev, tab];
+      });
+      setNotice(`SSH 会话已创建：${host.alias}`);
+    } catch (error: unknown) {
+      setNotice(`SSH 连接失败：${formatInvokeError(error)}`);
+    }
+  }, []);
+
   const splitActiveTab = useCallback(async () => {
     if (!activeTab || activeTab.panes.length >= 2) {
       return;
@@ -327,6 +404,10 @@ export function HostsWorkspace() {
   useEffect(() => {
     void loadHosts();
   }, [loadHosts]);
+
+  useEffect(() => {
+    void loadKeyOptions();
+  }, [loadKeyOptions]);
 
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
@@ -435,12 +516,25 @@ export function HostsWorkspace() {
               <li key={host.host_id}>
                 <div className="host-item-top">
                   <span>{host.alias}</span>
-                  <button type="button" onClick={() => void removeHost(host.host_id)}>
-                    删除
-                  </button>
+                  <div className="host-item-actions">
+                    <button type="button" onClick={() => void connectSshHost(host)}>
+                      SSH连接
+                    </button>
+                    <button type="button" onClick={() => void trustHost(host.host_id)}>
+                      信任指纹
+                    </button>
+                    <button type="button" onClick={() => void removeHost(host.host_id)}>
+                      删除
+                    </button>
+                  </div>
                 </div>
                 <div className="host-item-meta">
                   {host.username}@{host.address}:{host.port}
+                </div>
+                <div className="host-item-meta">
+                  认证：{host.auth_mode}
+                  {host.proxy_jump ? ` · ProxyJump: ${host.proxy_jump}` : ""}
+                  {host.key_id ? ` · Key: ${host.key_id.slice(0, 8)}` : ""}
                 </div>
               </li>
             ))}
@@ -464,7 +558,7 @@ export function HostsWorkspace() {
               placeholder="地址，例如 10.10.1.8"
               required
             />
-            <div className="host-form-inline">
+            <div className="host-form-inline-wide">
               <input
                 value={hostForm.username}
                 onChange={(event) =>
@@ -481,6 +575,43 @@ export function HostsWorkspace() {
                 placeholder="端口"
               />
             </div>
+            <div className="host-form-inline">
+              <select
+                value={hostForm.authMode}
+                onChange={(event) =>
+                  setHostForm((prev) => ({
+                    ...prev,
+                    authMode: event.currentTarget.value as HostForm["authMode"],
+                  }))
+                }
+              >
+                <option value="auto">自动</option>
+                <option value="password">密码</option>
+                <option value="key">密钥</option>
+                <option value="agent">Agent</option>
+              </select>
+              <input
+                value={hostForm.proxyJump}
+                onChange={(event) =>
+                  setHostForm((prev) => ({ ...prev, proxyJump: event.currentTarget.value }))
+                }
+                placeholder="ProxyJump，例如 bastion 或 u1@h1,u2@h2"
+              />
+            </div>
+            <select
+              value={hostForm.keyId}
+              onChange={(event) =>
+                setHostForm((prev) => ({ ...prev, keyId: event.currentTarget.value }))
+              }
+              disabled={hostForm.authMode !== "key"}
+            >
+              <option value="">选择密钥（仅密钥认证）</option>
+              {keyOptions.map((item) => (
+                <option key={item.key_id} value={item.key_id}>
+                  {item.name} / {item.key_id.slice(0, 8)}
+                </option>
+              ))}
+            </select>
             <input
               value={hostForm.tags}
               onChange={(event) =>

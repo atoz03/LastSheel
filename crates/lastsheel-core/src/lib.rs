@@ -50,7 +50,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M3-Hosts+Vault+Store".to_string(),
+            active_milestone: "M4-SSH直连(阶段2)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -91,6 +91,12 @@ pub struct HostItemDto {
     pub address: String,
     pub port: u16,
     pub username: String,
+    #[serde(default = "default_host_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub proxy_jump: String,
     pub tags: Vec<String>,
     pub note: String,
     pub pinned: bool,
@@ -103,9 +109,19 @@ pub struct HostUpsertInputDto {
     pub address: String,
     pub port: u16,
     pub username: String,
+    #[serde(default = "default_host_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub proxy_jump: String,
     pub tags: Vec<String>,
     pub note: String,
     pub pinned: bool,
+}
+
+fn default_host_auth_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,4 +141,15 @@ pub struct KeyMetadataDto {
     pub name: String,
     pub has_passphrase: bool,
     pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownHostItemDto {
+    pub host_id: String,
+    pub address: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub key_b64: String,
+    pub fingerprint_sha256: String,
+    pub trusted_at_ms: i64,
 }

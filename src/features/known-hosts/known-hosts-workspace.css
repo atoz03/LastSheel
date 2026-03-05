@@ -1,0 +1,61 @@
+.known-hosts-workspace {
+  border: 1px solid #2c426d;
+  border-radius: 12px;
+  background: rgba(12, 22, 40, 0.78);
+  padding: 16px;
+}
+
+.known-hosts-workspace header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.known-hosts-workspace header h3 {
+  margin: 0;
+}
+
+.known-hosts-workspace header p {
+  margin: 0;
+  color: #9bb2d7;
+  flex: 1;
+}
+
+.known-hosts-workspace header button {
+  border: 1px solid #40649f;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #d7e6ff;
+  background: #152742;
+  cursor: pointer;
+}
+
+.known-hosts-workspace ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.known-hosts-workspace li {
+  border: 1px solid #2f476f;
+  border-radius: 8px;
+  padding: 10px;
+  background: #13223d;
+  color: #c9dbf7;
+}
+
+.known-hosts-workspace li div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+}
+
+.known-hosts-workspace .empty {
+  text-align: center;
+  color: #8ea7ca;
+}

@@ -68,7 +68,12 @@
   gap: 8px;
 }
 
-.host-item-top button {
+.host-item-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.host-item-actions button {
   border: 1px solid #4f6e9c;
   border-radius: 6px;
   padding: 0 6px;
@@ -91,6 +96,7 @@
 }
 
 .host-form input,
+.host-form select,
 .host-form textarea {
   width: 100%;
   border: 1px solid #335481;
@@ -108,6 +114,12 @@
 .host-form-inline {
   display: grid;
   grid-template-columns: 1fr 90px;
+  gap: 8px;
+}
+
+.host-form-inline-wide {
+  display: grid;
+  grid-template-columns: 160px 1fr;
   gap: 8px;
 }
 

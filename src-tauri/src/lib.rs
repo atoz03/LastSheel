@@ -5,7 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use lastsheel_core::{
     AppBootstrapDto, ErrorCode, ErrorDto, HostItemDto, HostUpsertInputDto, KeyImportResultDto,
-    KeyMetadataDto, TerminalOutputEventDto, TerminalSessionDto, TerminalState,
+    KeyMetadataDto, KnownHostItemDto, TerminalOutputEventDto, TerminalSessionDto, TerminalState,
     TerminalStatusEventDto, VaultStatusDto,
 };
 use parking_lot::Mutex;
@@ -13,9 +13,11 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +28,7 @@ struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send>,
+    cleanup_paths: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -35,6 +38,11 @@ struct TerminalManager {
 
 #[derive(Default)]
 struct HostsStoreManager {
+    lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct KnownHostsStoreManager {
     lock: Mutex<()>,
 }
 
@@ -55,6 +63,11 @@ struct VaultRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct HostsStoreFile {
     items: Vec<HostItemDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KnownHostsStoreFile {
+    items: Vec<KnownHostItemDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +123,14 @@ fn hosts_store_path(app: &tauri::AppHandle) -> Result<PathBuf, ErrorDto> {
     Ok(app_store_dir(app)?.join("hosts.json"))
 }
 
+fn known_hosts_store_path(app: &tauri::AppHandle) -> Result<PathBuf, ErrorDto> {
+    Ok(app_store_dir(app)?.join("known_hosts.json"))
+}
+
+fn known_hosts_ssh_path(app: &tauri::AppHandle) -> Result<PathBuf, ErrorDto> {
+    Ok(app_store_dir(app)?.join("known_hosts"))
+}
+
 fn vault_store_path(app: &tauri::AppHandle) -> Result<PathBuf, ErrorDto> {
     Ok(app_store_dir(app)?.join("vault.lsv"))
 }
@@ -152,6 +173,152 @@ fn save_hosts_to_disk(app: &tauri::AppHandle, store: &HostsStoreFile) -> Result<
     let body = serde_json::to_vec_pretty(store)
         .map_err(|_| ErrorDto::new(ErrorCode::IoError, "序列化 Hosts 数据失败"))?;
     write_atomic(&path, &body)
+}
+
+fn load_known_hosts_from_disk(app: &tauri::AppHandle) -> Result<KnownHostsStoreFile, ErrorDto> {
+    let path = known_hosts_store_path(app)?;
+    if !path.exists() {
+        return Ok(KnownHostsStoreFile::default());
+    }
+
+    let text = fs::read_to_string(path)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取 known_hosts 存储失败"))?;
+    serde_json::from_str(&text)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "解析 known_hosts 数据失败"))
+}
+
+fn save_known_hosts_to_disk(
+    app: &tauri::AppHandle,
+    store: &KnownHostsStoreFile,
+) -> Result<(), ErrorDto> {
+    let path = known_hosts_store_path(app)?;
+    let body = serde_json::to_vec_pretty(store)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "序列化 known_hosts 数据失败"))?;
+    write_atomic(&path, &body)?;
+
+    let ssh_path = known_hosts_ssh_path(app)?;
+    let mut lines: Vec<String> = Vec::new();
+    for item in &store.items {
+        lines.push(format!(
+            "[{}]:{} {} {}",
+            item.address, item.port, item.algorithm, item.key_b64
+        ));
+    }
+    let body = lines.join("\n");
+    write_atomic(&ssh_path, body.as_bytes())?;
+    Ok(())
+}
+
+fn current_time_ms() -> Result<i64, ErrorDto> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "系统时间异常"))?
+        .as_millis() as i64)
+}
+
+fn host_key_algorithm_name(key_type: ssh2::HostKeyType) -> Option<&'static str> {
+    match key_type {
+        ssh2::HostKeyType::Rsa => Some("ssh-rsa"),
+        ssh2::HostKeyType::Dss => Some("ssh-dss"),
+        ssh2::HostKeyType::Ecdsa256 => Some("ecdsa-sha2-nistp256"),
+        ssh2::HostKeyType::Ecdsa384 => Some("ecdsa-sha2-nistp384"),
+        ssh2::HostKeyType::Ecdsa521 => Some("ecdsa-sha2-nistp521"),
+        ssh2::HostKeyType::Ed25519 => Some("ssh-ed25519"),
+        _ => None,
+    }
+}
+
+fn probe_remote_host_key(address: &str, port: u16) -> Result<(String, String, String), ErrorDto> {
+    let tcp = TcpStream::connect((address, port))
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "无法连接远端 SSH 端口"))?;
+    let mut session =
+        ssh2::Session::new().map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建 SSH 会话失败"))?;
+    session.set_tcp_stream(tcp);
+    session
+        .handshake()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
+
+    let (host_key, key_type) = session
+        .host_key()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "读取主机公钥失败"))?;
+    let algorithm = host_key_algorithm_name(key_type)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "暂不支持该主机公钥算法"))?
+        .to_string();
+
+    let key_b64 = STANDARD.encode(host_key);
+    let fingerprint = format!("SHA256:{}", STANDARD.encode(Sha256::digest(host_key)));
+    Ok((algorithm, key_b64, fingerprint))
+}
+
+fn normalize_auth_mode(input: &str) -> String {
+    match input.trim().to_lowercase().as_str() {
+        "key" => "key".to_string(),
+        "password" => "password".to_string(),
+        "agent" => "agent".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
+fn validate_proxy_jump(proxy_jump: &str) -> Result<String, ErrorDto> {
+    let normalized = proxy_jump.trim().to_string();
+    if normalized.is_empty() {
+        return Ok(String::new());
+    }
+    let hops: Vec<&str> = normalized.split(',').map(|hop| hop.trim()).collect();
+    if hops.len() > 2 {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "ProxyJump 最多支持 2 跳（逗号分隔）",
+        ));
+    }
+    if hops.iter().any(|hop| hop.is_empty()) {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "ProxyJump 格式错误，请使用 host 或 user@host",
+        ));
+    }
+    Ok(hops.join(","))
+}
+
+fn create_temp_private_key_file(
+    app: &tauri::AppHandle,
+    key_id: &str,
+    pem_text: &str,
+) -> Result<PathBuf, ErrorDto> {
+    let dir = app_store_dir(app)?.join("tmp-keys");
+    fs::create_dir_all(&dir)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建临时密钥目录失败"))?;
+    let path = dir.join(format!("id_{}_{}", key_id, Uuid::new_v4()));
+    write_atomic(&path, pem_text.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "设置私钥文件权限失败"))?;
+    }
+    Ok(path)
+}
+
+fn prepare_ssh_identity_file(
+    app: &tauri::AppHandle,
+    vault_manager: &State<VaultManager>,
+    key_id: &str,
+) -> Result<PathBuf, ErrorDto> {
+    let runtime = vault_manager.runtime.lock();
+    if !runtime.unlocked {
+        return Err(ErrorDto::new(
+            ErrorCode::VaultLocked,
+            "使用密钥认证前请先解锁 Vault",
+        ));
+    }
+    let key = runtime
+        .data
+        .keys
+        .iter()
+        .find(|item| item.key_id == key_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "找不到指定的密钥"))?;
+    create_temp_private_key_file(app, &key.key_id, &key.pem_text)
 }
 
 fn decode_fixed<const N: usize>(input: &str) -> Result<[u8; N], ErrorDto> {
@@ -264,7 +431,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
     let features = vec![
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
-        "pnpm + Rust CI 工作流".to_string(),
+        "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段2）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -296,6 +463,8 @@ fn store_hosts_upsert(
     let alias = input.alias.trim().to_string();
     let address = input.address.trim().to_string();
     let username = input.username.trim().to_string();
+    let auth_mode = normalize_auth_mode(&input.auth_mode);
+    let proxy_jump = validate_proxy_jump(&input.proxy_jump)?;
     if alias.is_empty() || address.is_empty() || username.is_empty() {
         return Err(ErrorDto::new(
             ErrorCode::Unsupported,
@@ -309,6 +478,12 @@ fn store_hosts_upsert(
         address,
         port: if input.port == 0 { 22 } else { input.port },
         username,
+        auth_mode,
+        key_id: input
+            .key_id
+            .map(|value| value.trim().to_string())
+            .and_then(|value| if value.is_empty() { None } else { Some(value) }),
+        proxy_jump,
         tags: input
             .tags
             .into_iter()
@@ -484,32 +659,66 @@ fn key_list(manager: State<VaultManager>) -> Result<Vec<KeyMetadataDto>, ErrorDt
         .collect())
 }
 
-fn detect_shell(shell_profile: Option<String>) -> String {
-    if let Some(profile) = shell_profile {
-        if !profile.trim().is_empty() {
-            return profile;
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        "powershell.exe".to_string()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
-    }
+#[tauri::command]
+fn known_hosts_list(
+    app: tauri::AppHandle,
+    manager: State<KnownHostsStoreManager>,
+) -> Result<Vec<KnownHostItemDto>, ErrorDto> {
+    let _guard = manager.lock.lock();
+    let store = load_known_hosts_from_disk(&app)?;
+    Ok(store.items)
 }
 
 #[tauri::command]
-fn terminal_spawn_local(
+fn known_hosts_trust(
     app: tauri::AppHandle,
-    manager: State<TerminalManager>,
-    shell_profile: Option<String>,
+    hosts_manager: State<HostsStoreManager>,
+    manager: State<KnownHostsStoreManager>,
+    host_id: String,
+) -> Result<KnownHostItemDto, ErrorDto> {
+    let _hosts_guard = hosts_manager.lock.lock();
+    let hosts = load_hosts_from_disk(&app)?;
+    let host = hosts
+        .items
+        .iter()
+        .find(|item| item.host_id == host_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?;
+
+    let (algorithm, key_b64, fingerprint_sha256) = probe_remote_host_key(&host.address, host.port)?;
+    let trusted_at_ms = current_time_ms()?;
+    let known_item = KnownHostItemDto {
+        host_id: host.host_id.clone(),
+        address: host.address.clone(),
+        port: host.port,
+        algorithm,
+        key_b64,
+        fingerprint_sha256,
+        trusted_at_ms,
+    };
+
+    let _known_guard = manager.lock.lock();
+    let mut store = load_known_hosts_from_disk(&app)?;
+    if let Some(existing) = store
+        .items
+        .iter_mut()
+        .find(|item| item.address == known_item.address && item.port == known_item.port)
+    {
+        *existing = known_item.clone();
+    } else {
+        store.items.push(known_item.clone());
+    }
+    save_known_hosts_to_disk(&app, &store)?;
+    Ok(known_item)
+}
+
+fn spawn_terminal_with_command(
+    app: &tauri::AppHandle,
+    manager: &State<TerminalManager>,
+    mut command: CommandBuilder,
+    cleanup_paths: Vec<PathBuf>,
 ) -> Result<TerminalSessionDto, ErrorDto> {
     let terminal_id = Uuid::new_v4().to_string();
-    emit_terminal_status(&app, &terminal_id, TerminalState::Connecting, None);
+    emit_terminal_status(app, &terminal_id, TerminalState::Connecting, None);
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -519,14 +728,13 @@ fn terminal_spawn_local(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建本地终端失败"))?;
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建终端会话失败"))?;
 
-    let shell = detect_shell(shell_profile);
-    let cmd = CommandBuilder::new(shell);
+    command.env("TERM", "xterm-256color");
     let child = pair
         .slave
-        .spawn_command(cmd)
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "启动本地 shell 失败"))?;
+        .spawn_command(command)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "启动终端进程失败"))?;
     drop(pair.slave);
 
     let mut reader = pair
@@ -544,6 +752,7 @@ fn terminal_spawn_local(
             master: pair.master,
             writer,
             child,
+            cleanup_paths,
         },
     );
 
@@ -585,8 +794,134 @@ fn terminal_spawn_local(
         }
     });
 
-    emit_terminal_status(&app, &terminal_id, TerminalState::Ready, None);
+    emit_terminal_status(app, &terminal_id, TerminalState::Ready, None);
     Ok(TerminalSessionDto { terminal_id })
+}
+
+fn detect_shell(shell_profile: Option<String>) -> String {
+    if let Some(profile) = shell_profile {
+        if !profile.trim().is_empty() {
+            return profile;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        "powershell.exe".to_string()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    }
+}
+
+#[tauri::command]
+fn terminal_spawn_local(
+    app: tauri::AppHandle,
+    manager: State<TerminalManager>,
+    shell_profile: Option<String>,
+) -> Result<TerminalSessionDto, ErrorDto> {
+    let shell = detect_shell(shell_profile);
+    let cmd = CommandBuilder::new(shell);
+    spawn_terminal_with_command(&app, &manager, cmd, Vec::new())
+}
+
+#[tauri::command]
+fn terminal_connect_ssh(
+    app: tauri::AppHandle,
+    terminal_manager: State<TerminalManager>,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    host_id: String,
+) -> Result<TerminalSessionDto, ErrorDto> {
+    let _hosts_guard = hosts_manager.lock.lock();
+    let hosts = load_hosts_from_disk(&app)?;
+    let host = hosts
+        .items
+        .iter()
+        .find(|item| item.host_id == host_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?;
+
+    let (algorithm, key_b64, fingerprint_sha256) = probe_remote_host_key(&host.address, host.port)?;
+
+    let _known_guard = known_hosts_manager.lock.lock();
+    let known_hosts_store = load_known_hosts_from_disk(&app)?;
+    let known = known_hosts_store
+        .items
+        .iter()
+        .find(|item| item.address == host.address && item.port == host.port);
+
+    match known {
+        None => {
+            return Err(ErrorDto::new(
+                ErrorCode::HostkeyUnknown,
+                format!(
+                    "未知主机指纹：{}，请先在 Known Hosts 页面信任该主机",
+                    fingerprint_sha256
+                ),
+            ));
+        }
+        Some(item) => {
+            if item.key_b64 != key_b64 || item.algorithm != algorithm {
+                return Err(ErrorDto::new(
+                    ErrorCode::HostkeyChanged,
+                    format!(
+                        "主机指纹变化：旧={} 新={}",
+                        item.fingerprint_sha256, fingerprint_sha256
+                    ),
+                ));
+            }
+        }
+    }
+
+    let known_hosts_path = known_hosts_ssh_path(&app)?;
+    let null_known_hosts = if cfg!(target_os = "windows") {
+        "NUL"
+    } else {
+        "/dev/null"
+    };
+    let mut cleanup_paths = Vec::new();
+    let mut cmd = CommandBuilder::new("ssh");
+    cmd.arg("-p");
+    cmd.arg(host.port.to_string());
+    cmd.arg("-o");
+    cmd.arg("StrictHostKeyChecking=yes");
+    cmd.arg("-o");
+    cmd.arg(format!("GlobalKnownHostsFile={null_known_hosts}"));
+    cmd.arg("-o");
+    cmd.arg(format!(
+        "UserKnownHostsFile={}",
+        known_hosts_path.to_string_lossy()
+    ));
+    if !host.proxy_jump.trim().is_empty() {
+        cmd.arg("-J");
+        cmd.arg(host.proxy_jump.clone());
+    }
+    match host.auth_mode.as_str() {
+        "key" => {
+            let key_id = host
+                .key_id
+                .as_ref()
+                .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "当前 Host 未配置密钥"))?;
+            let identity_path = prepare_ssh_identity_file(&app, &vault_manager, key_id)?;
+            cmd.arg("-i");
+            cmd.arg(identity_path.to_string_lossy().to_string());
+            cmd.arg("-o");
+            cmd.arg("IdentitiesOnly=yes");
+            cleanup_paths.push(identity_path);
+        }
+        "agent" => {
+            cmd.arg("-o");
+            cmd.arg("IdentitiesOnly=no");
+        }
+        "password" | "auto" => {}
+        _ => {}
+    }
+    cmd.arg(format!("{}@{}", host.username, host.address));
+
+    spawn_terminal_with_command(&app, &terminal_manager, cmd, cleanup_paths)
 }
 
 #[tauri::command]
@@ -652,6 +987,9 @@ fn terminal_close(
             .child
             .kill()
             .map_err(|_| ErrorDto::new(ErrorCode::IoError, "关闭终端进程失败"))?;
+        for path in current.cleanup_paths {
+            let _ = fs::remove_file(path);
+        }
         emit_terminal_status(
             &app,
             &terminal_id,
@@ -669,6 +1007,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
         .manage(HostsStoreManager::default())
+        .manage(KnownHostsStoreManager::default())
         .manage(VaultManager::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -676,12 +1015,15 @@ pub fn run() {
             store_hosts_list,
             store_hosts_upsert,
             store_hosts_delete,
+            known_hosts_list,
+            known_hosts_trust,
             vault_status,
             vault_unlock,
             vault_lock,
             key_import_private_key,
             key_list,
             terminal_spawn_local,
+            terminal_connect_ssh,
             terminal_write,
             terminal_resize,
             terminal_close

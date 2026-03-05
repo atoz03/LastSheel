@@ -1,4 +1,5 @@
 import { KeychainWorkspace } from "./features/keychain/KeychainWorkspace";
+import { KnownHostsWorkspace } from "./features/known-hosts/KnownHostsWorkspace";
 import { HostsWorkspace } from "./features/terminal/HostsWorkspace";
 
 type FeaturePageProps = {
@@ -58,17 +59,7 @@ export function SnippetsPage() {
 }
 
 export function KnownHostsPage() {
-  return (
-    <FeaturePage
-      title="Known Hosts"
-      summary="严格主机指纹校验，未知主机需确认，变更强制阻断。"
-      bullets={[
-        "首次连接必须确认指纹",
-        "指纹变化返回 HOSTKEY_CHANGED",
-        "信任记录仅写应用内数据库",
-      ]}
-    />
-  );
+  return <KnownHostsWorkspace />;
 }
 
 export function LogsPage() {
