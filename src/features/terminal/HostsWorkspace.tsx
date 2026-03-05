@@ -834,6 +834,68 @@ export function HostsWorkspace() {
     }
   }, [activeTab, checkedRemotePathsByTab, hostById, remoteEntriesByTab, requestPasswordForHost, upsertTransferItem]);
 
+  const startArchiveDownload = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法发起压缩下载：Host 不存在。");
+      return;
+    }
+    const targets = (checkedRemotePathsByTab[activeTab.tab_id] ?? []).filter((path) => path.trim().length > 0);
+    if (targets.length === 0) {
+      setNotice("请先勾选要打包下载的远端文件或目录。");
+      return;
+    }
+    const customLocalPath = window.prompt("可选：输入本地压缩包路径（留空则自动命名）", "");
+    if (customLocalPath === null) {
+      setNotice("已取消压缩下载。");
+      return;
+    }
+    const conflictPolicy = askConflictPolicy("rename");
+    if (conflictPolicy === null) {
+      setNotice("已取消压缩下载。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      const response = await invoke<TransferStartResponse>("archive_pack_stream_download", {
+        input: {
+          hostId: host.host_id,
+          paths: targets,
+          archiveFormat: "tar_gz",
+          localPath: customLocalPath.trim() ? customLocalPath.trim() : null,
+          password,
+          conflictPolicy,
+        },
+      });
+      upsertTransferItem({
+        transfer_id: response.transfer_id,
+        direction: "download",
+        host_alias: host.alias,
+        target_path: `压缩下载(${targets.length}项)`,
+        state: "queued",
+        done_bytes: 0,
+        total_bytes: null,
+        message: response.resolved_local_path ?? "压缩下载任务已创建",
+      });
+      setNotice(`压缩下载任务已创建：${targets.length} 项。`);
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`压缩下载失败：${formatInvokeError(error)}`);
+    } finally {
+      setTransferBusy(false);
+    }
+  }, [activeTab, checkedRemotePathsByTab, hostById, requestPasswordForHost, upsertTransferItem]);
+
   const startBatchDelete = useCallback(async () => {
     if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
       return;
@@ -1580,6 +1642,17 @@ export function HostsWorkspace() {
                     }
                   >
                     批量下载（{activeCheckedDownloadCount}）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void startArchiveDownload()}
+                    disabled={
+                      transferBusy ||
+                      remoteLoadingTabId === activeTab.tab_id ||
+                      activeCheckedEntryCount === 0
+                    }
+                  >
+                    压缩下载
                   </button>
                   <button
                     type="button"

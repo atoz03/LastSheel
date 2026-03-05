@@ -269,6 +269,16 @@ pub struct TransferUploadInputDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivePackDownloadInputDto {
+    pub host_id: String,
+    pub paths: Vec<String>,
+    pub archive_format: Option<String>,
+    pub local_path: Option<String>,
+    pub password: Option<String>,
+    pub conflict_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferVerifyResultDto {
     pub ok: bool,
     pub sha256: Option<String>,

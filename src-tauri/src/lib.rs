@@ -4,13 +4,14 @@ use argon2::Argon2;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use lastsheel_core::{
-    AppBootstrapDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType, FsDeleteInputDto,
-    FsDeleteResultDto, FsListResponseDto, FsReadTextInputDto, FsReadTextResultDto,
-    FsWriteTextInputDto, FsWriteTextResultDto, HostItemDto, HostUpsertInputDto, KeyImportResultDto,
-    KeyMetadataDto, KnownHostItemDto, TerminalOutputEventDto, TerminalSessionDto, TerminalState,
-    TerminalStatusEventDto, TransferDownloadInputDto, TransferStartDto, TransferState,
-    TransferUpdateEventDto, TransferUploadInputDto, TransferVerifyEventDto,
-    TransferVerifyResultDto, TransferVerifyState, VaultStatusDto,
+    AppBootstrapDto, ArchivePackDownloadInputDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType,
+    FsDeleteInputDto, FsDeleteResultDto, FsListResponseDto, FsReadTextInputDto,
+    FsReadTextResultDto, FsWriteTextInputDto, FsWriteTextResultDto, HostItemDto,
+    HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
+    TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
+    TransferDownloadInputDto, TransferStartDto, TransferState, TransferUpdateEventDto,
+    TransferUploadInputDto, TransferVerifyEventDto, TransferVerifyResultDto, TransferVerifyState,
+    VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -706,7 +707,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
-        "文件栏与传输增强（批量下载/冲突策略/SHA256 + 在线编辑与删除，阶段4）".to_string(),
+        "文件栏与传输增强（批量下载/压缩下载/冲突策略/SHA256 + 在线编辑与删除，阶段4）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -1159,10 +1160,10 @@ fn authenticate_sftp_session(
     Ok(())
 }
 
-fn open_authenticated_sftp(
+fn open_authenticated_session(
     host: &HostItemDto,
     prepared_auth: &PreparedSshAuth,
-) -> Result<ssh2::Sftp, ErrorDto> {
+) -> Result<ssh2::Session, ErrorDto> {
     let tcp = TcpStream::connect((host.address.as_str(), host.port))
         .map_err(|_| ErrorDto::new(ErrorCode::IoError, "连接远端 SSH 端口失败"))?;
     let mut session =
@@ -1172,6 +1173,14 @@ fn open_authenticated_sftp(
         .handshake()
         .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
     authenticate_sftp_session(&mut session, &host.username, prepared_auth)?;
+    Ok(session)
+}
+
+fn open_authenticated_sftp(
+    host: &HostItemDto,
+    prepared_auth: &PreparedSshAuth,
+) -> Result<ssh2::Sftp, ErrorDto> {
+    let session = open_authenticated_session(host, prepared_auth)?;
     session
         .sftp()
         .map_err(|_| ErrorDto::new(ErrorCode::IoError, "初始化 SFTP 通道失败"))
@@ -1650,6 +1659,62 @@ fn resolve_download_target_path(
     }
 }
 
+fn resolve_archive_download_target_path(
+    app: &tauri::AppHandle,
+    host: &HostItemDto,
+    local_path: Option<String>,
+    default_file_name: &str,
+    conflict_policy: &str,
+) -> Result<PathBuf, ErrorDto> {
+    let candidate = local_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            app.path()
+                .download_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("LastSheel")
+                .join(sanitize_path_segment(&host.alias))
+                .join(default_file_name)
+        });
+    let mut candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        std::env::current_dir()
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取当前目录失败"))?
+            .join(candidate)
+    };
+    if candidate.exists() && candidate.is_dir() {
+        candidate = candidate.join(default_file_name);
+    }
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "无效的下载路径"))?;
+    fs::create_dir_all(parent)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建下载目录失败"))?;
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    match conflict_policy {
+        "overwrite" => Ok(candidate),
+        "skip" => Err(ErrorDto::new(
+            ErrorCode::Conflict,
+            format!("目标文件已存在：{}", path_to_string(&candidate)),
+        )),
+        _ => Ok(resolve_conflict_path(candidate)),
+    }
+}
+
+fn build_remote_tar_command(paths: &[String]) -> String {
+    let escaped_paths = paths
+        .iter()
+        .map(|path| format!("'{}'", path.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("tar -czf - -- {escaped_paths}")
+}
+
 fn resolve_remote_conflict_path(
     sftp: &ssh2::Sftp,
     remote_path: &str,
@@ -1873,6 +1938,227 @@ fn transfer_download(
                     total_bytes,
                     Some(format!(
                         "下载完成：{}",
+                        path_to_string(&resolved_local_path_for_thread)
+                    )),
+                )
+            }
+            Err(error) => {
+                let state = if matches!(error.code, ErrorCode::Canceled) {
+                    TransferState::Canceled
+                } else {
+                    TransferState::Error
+                };
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(&manager, &transfer_id_for_thread, state.clone());
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    state,
+                    0,
+                    None,
+                    Some(error.message),
+                );
+            }
+        }
+        remove_transfer_control(&app_handle, &transfer_id_for_thread);
+    });
+
+    Ok(TransferStartDto {
+        transfer_id,
+        resolved_local_path: Some(path_to_string(&resolved_local_path)),
+        resolved_remote_path: None,
+    })
+}
+
+#[tauri::command]
+fn archive_pack_stream_download(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    transfer_manager: State<TransferManager>,
+    input: ArchivePackDownloadInputDto,
+) -> Result<TransferStartDto, ErrorDto> {
+    if input
+        .archive_format
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("tar_gz"))
+    {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前仅支持 tar_gz 压缩下载",
+        ));
+    }
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "传输当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let mut selected_paths = Vec::new();
+    let mut dedup = HashSet::new();
+    for path in input.paths {
+        let trimmed = path.trim().to_string();
+        validate_remote_target_path(&trimmed)?;
+        if dedup.insert(trimmed.clone()) {
+            selected_paths.push(trimmed);
+        }
+    }
+    if selected_paths.is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "至少需要一个远端路径",
+        ));
+    }
+
+    let conflict_policy = normalize_conflict_policy(input.conflict_policy.as_deref(), "rename");
+    let default_file_name = format!(
+        "{}-bundle-{}.tar.gz",
+        sanitize_path_segment(&host.alias),
+        current_time_ms()?
+    );
+    let resolved_local_path = resolve_archive_download_target_path(
+        &app,
+        &host,
+        input.local_path,
+        &default_file_name,
+        &conflict_policy,
+    )?;
+
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
+    upsert_transfer_record(
+        &transfer_manager,
+        TransferRecord {
+            transfer_id: transfer_id.clone(),
+            direction: "download".to_string(),
+            local_path: Some(resolved_local_path.clone()),
+            state: TransferState::Queued,
+        },
+    );
+    emit_transfer_update(
+        &app,
+        &transfer_id,
+        TransferState::Queued,
+        0,
+        None,
+        Some("压缩下载任务已入队".to_string()),
+    );
+
+    let app_handle = app.clone();
+    let transfer_id_for_thread = transfer_id.clone();
+    let resolved_local_path_for_thread = resolved_local_path.clone();
+    thread::spawn(move || {
+        let manager = app_handle.state::<TransferManager>();
+        update_transfer_record_state(&manager, &transfer_id_for_thread, TransferState::Running);
+        emit_transfer_update(
+            &app_handle,
+            &transfer_id_for_thread,
+            TransferState::Running,
+            0,
+            None,
+            Some("开始远端打包下载".to_string()),
+        );
+        let run_result = (|| -> Result<(u64, Option<u64>), ErrorDto> {
+            let session = open_authenticated_session(&host, &prepared_auth)?;
+            let mut probe_channel = session
+                .channel_session()
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端命令通道失败"))?;
+            probe_channel
+                .exec("command -v tar >/dev/null 2>&1")
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "检测远端 tar 失败"))?;
+            probe_channel
+                .wait_close()
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "检测远端 tar 失败"))?;
+            if probe_channel.exit_status().unwrap_or(1) != 0 {
+                return Err(ErrorDto::new(
+                    ErrorCode::DepMissing,
+                    "远端缺少 tar 命令，无法执行压缩下载",
+                ));
+            }
+
+            let command = build_remote_tar_command(&selected_paths);
+            let mut channel = session
+                .channel_session()
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端命令通道失败"))?;
+            channel
+                .exec(&command)
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "启动远端压缩命令失败"))?;
+            let mut local_file = fs::File::create(&resolved_local_path_for_thread)
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建本地压缩包失败"))?;
+
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut done_bytes = 0_u64;
+            loop {
+                if canceled.load(Ordering::Relaxed) {
+                    let _ = channel.close();
+                    let _ = fs::remove_file(&resolved_local_path_for_thread);
+                    return Err(ErrorDto::new(ErrorCode::Canceled, "压缩下载已取消"));
+                }
+                let read_size = channel
+                    .read(&mut buffer)
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端压缩流失败"))?;
+                if read_size == 0 {
+                    break;
+                }
+                local_file
+                    .write_all(&buffer[..read_size])
+                    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "写入本地压缩包失败"))?;
+                done_bytes = done_bytes.saturating_add(read_size as u64);
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Running,
+                    done_bytes,
+                    None,
+                    None,
+                );
+            }
+            local_file
+                .flush()
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "写入本地压缩包失败"))?;
+            channel
+                .wait_close()
+                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "结束远端压缩命令失败"))?;
+            let status = channel.exit_status().unwrap_or(1);
+            if status != 0 {
+                let mut stderr_text = String::new();
+                let _ = channel.stderr().read_to_string(&mut stderr_text);
+                let message = if stderr_text.trim().is_empty() {
+                    "远端压缩命令执行失败".to_string()
+                } else {
+                    format!("远端压缩失败：{}", stderr_text.trim())
+                };
+                let _ = fs::remove_file(&resolved_local_path_for_thread);
+                return Err(ErrorDto::new(ErrorCode::IoError, message));
+            }
+            Ok((done_bytes, None))
+        })();
+
+        match run_result {
+            Ok((done_bytes, total_bytes)) => {
+                let manager = app_handle.state::<TransferManager>();
+                update_transfer_record_state(
+                    &manager,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                );
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Done,
+                    done_bytes,
+                    total_bytes,
+                    Some(format!(
+                        "压缩下载完成：{}",
                         path_to_string(&resolved_local_path_for_thread)
                     )),
                 )
@@ -2454,6 +2740,7 @@ pub fn run() {
             fs_read_text,
             fs_write_text_atomic,
             transfer_download,
+            archive_pack_stream_download,
             transfer_upload,
             transfer_cancel,
             transfer_verify_sha256,
