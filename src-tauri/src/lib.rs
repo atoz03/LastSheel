@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
@@ -216,37 +216,161 @@ fn current_time_ms() -> Result<i64, ErrorDto> {
         .as_millis() as i64)
 }
 
-fn host_key_algorithm_name(key_type: ssh2::HostKeyType) -> Option<&'static str> {
-    match key_type {
-        ssh2::HostKeyType::Rsa => Some("ssh-rsa"),
-        ssh2::HostKeyType::Dss => Some("ssh-dss"),
-        ssh2::HostKeyType::Ecdsa256 => Some("ecdsa-sha2-nistp256"),
-        ssh2::HostKeyType::Ecdsa384 => Some("ecdsa-sha2-nistp384"),
-        ssh2::HostKeyType::Ecdsa521 => Some("ecdsa-sha2-nistp521"),
-        ssh2::HostKeyType::Ed25519 => Some("ssh-ed25519"),
-        _ => None,
-    }
+fn command_exists(command: &str) -> bool {
+    ProcessCommand::new(command).arg("-V").output().is_ok()
 }
 
-fn probe_remote_host_key(address: &str, port: u16) -> Result<(String, String, String), ErrorDto> {
-    let tcp = TcpStream::connect((address, port))
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "无法连接远端 SSH 端口"))?;
-    let mut session =
-        ssh2::Session::new().map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建 SSH 会话失败"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
+fn ensure_dependency(command: &str, install_hint: &str) -> Result<(), ErrorDto> {
+    if command_exists(command) {
+        return Ok(());
+    }
+    Err(ErrorDto::new(
+        ErrorCode::DepMissing,
+        format!("缺少依赖命令 `{command}`，请先安装（{install_hint}）"),
+    ))
+}
 
-    let (host_key, key_type) = session
-        .host_key()
-        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "读取主机公钥失败"))?;
-    let algorithm = host_key_algorithm_name(key_type)
-        .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "暂不支持该主机公钥算法"))?
+fn compact_stderr(stderr: &str) -> String {
+    let one_line = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" | ");
+    if one_line.is_empty() {
+        return "无详细输出".to_string();
+    }
+    if one_line.chars().count() <= 120 {
+        return one_line;
+    }
+    let truncated: String = one_line.chars().take(120).collect();
+    format!("{truncated}...")
+}
+
+fn classify_hostkey_probe_error(
+    stderr: &str,
+    address: &str,
+    port: u16,
+    proxy_jump: &str,
+) -> ErrorDto {
+    let lower = stderr.to_lowercase();
+    let has_proxy = !proxy_jump.trim().is_empty();
+    let detail = compact_stderr(stderr);
+    if has_proxy
+        && (lower.contains("proxyjump")
+            || lower.contains("jump host")
+            || lower.contains("stdio forwarding failed")
+            || lower.contains("kex_exchange_identification"))
+    {
+        return ErrorDto::new(
+            ErrorCode::ProxyJumpFailed,
+            format!("ProxyJump 链路失败（{proxy_jump}）：{detail}"),
+        );
+    }
+    if lower.contains("could not resolve hostname")
+        || lower.contains("name or service not known")
+        || lower.contains("temporary failure in name resolution")
+    {
+        return ErrorDto::new(
+            if has_proxy {
+                ErrorCode::ProxyJumpFailed
+            } else {
+                ErrorCode::IoError
+            },
+            if has_proxy {
+                format!("ProxyJump 地址解析失败（{proxy_jump}）：{detail}")
+            } else {
+                format!("远端地址解析失败（{address}:{port}）：{detail}")
+            },
+        );
+    }
+    if lower.contains("connection timed out") || lower.contains("operation timed out") {
+        return ErrorDto::new(
+            if has_proxy {
+                ErrorCode::ProxyJumpFailed
+            } else {
+                ErrorCode::IoError
+            },
+            if has_proxy {
+                format!("ProxyJump 链路超时（{proxy_jump}）：{detail}")
+            } else {
+                format!("连接远端主机超时（{address}:{port}）：{detail}")
+            },
+        );
+    }
+    if lower.contains("connection refused") {
+        return ErrorDto::new(
+            if has_proxy {
+                ErrorCode::ProxyJumpFailed
+            } else {
+                ErrorCode::IoError
+            },
+            if has_proxy {
+                format!("ProxyJump 链路被拒绝（{proxy_jump}）：{detail}")
+            } else {
+                format!("远端 SSH 端口拒绝连接（{address}:{port}）：{detail}")
+            },
+        );
+    }
+    if has_proxy {
+        return ErrorDto::new(
+            ErrorCode::ProxyJumpFailed,
+            format!("ProxyJump 链路异常（{proxy_jump}）：{detail}"),
+        );
+    }
+    ErrorDto::new(
+        ErrorCode::IoError,
+        format!("主机指纹探测失败（{address}:{port}）：{detail}"),
+    )
+}
+
+fn probe_remote_host_key(
+    address: &str,
+    port: u16,
+    proxy_jump: &str,
+) -> Result<(String, String, String), ErrorDto> {
+    ensure_dependency("ssh-keyscan", "OpenSSH 客户端套件")?;
+    let mut command = ProcessCommand::new("ssh-keyscan");
+    command
+        .arg("-T")
+        .arg("5")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-t")
+        .arg("rsa,ecdsa,ed25519");
+    if !proxy_jump.trim().is_empty() {
+        command.arg("-J").arg(proxy_jump.trim());
+    }
+    command.arg(address);
+    let output = command
+        .output()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "执行 ssh-keyscan 失败"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|value| !value.is_empty() && !value.starts_with('#'))
+        .ok_or_else(|| classify_hostkey_probe_error(&stderr, address, port, proxy_jump))?;
+    let mut parts = line.split_whitespace();
+    let _host = parts.next();
+    let algorithm = parts
+        .next()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "ssh-keyscan 返回格式异常"))?
+        .to_string();
+    let key_b64 = parts
+        .next()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "ssh-keyscan 返回格式异常"))?
         .to_string();
 
-    let key_b64 = STANDARD.encode(host_key);
-    let fingerprint = format!("SHA256:{}", STANDARD.encode(Sha256::digest(host_key)));
+    let host_key = STANDARD
+        .decode(&key_b64)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "主机公钥数据格式错误"))?;
+    let fingerprint = format!(
+        "SHA256:{}",
+        STANDARD.encode(Sha256::digest(host_key.as_slice()))
+    );
     Ok((algorithm, key_b64, fingerprint))
 }
 
@@ -257,6 +381,42 @@ fn normalize_auth_mode(input: &str) -> String {
         "agent" => "agent".to_string(),
         _ => "auto".to_string(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_one_time_password(
+    auth_mode: &str,
+    password: Option<String>,
+) -> Result<Option<String>, ErrorDto> {
+    if auth_mode != "password" {
+        return Ok(None);
+    }
+    if password
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "Windows 暂不支持一次性密码自动注入，请改用手动输入或其他认证方式",
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_one_time_password(
+    auth_mode: &str,
+    password: Option<String>,
+) -> Result<Option<String>, ErrorDto> {
+    if auth_mode != "password" {
+        return Ok(None);
+    }
+    let value = password
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .ok_or_else(|| ErrorDto::new(ErrorCode::AuthFailed, "密码认证需要输入一次性密码"))?;
+    Ok(Some(value))
 }
 
 fn validate_proxy_jump(proxy_jump: &str) -> Result<String, ErrorDto> {
@@ -276,6 +436,40 @@ fn validate_proxy_jump(proxy_jump: &str) -> Result<String, ErrorDto> {
             ErrorCode::Unsupported,
             "ProxyJump 格式错误，请使用 host 或 user@host",
         ));
+    }
+    for hop in &hops {
+        if hop.contains(char::is_whitespace) {
+            return Err(ErrorDto::new(
+                ErrorCode::Unsupported,
+                "ProxyJump 不能包含空白字符",
+            ));
+        }
+        let host_part = hop.rsplit_once('@').map(|(_, value)| value).unwrap_or(hop);
+        if host_part.is_empty() {
+            return Err(ErrorDto::new(
+                ErrorCode::Unsupported,
+                "ProxyJump 格式错误，请使用 host 或 user@host",
+            ));
+        }
+        if let Some((host, port_text)) = host_part.rsplit_once(':') {
+            if host.is_empty() {
+                return Err(ErrorDto::new(
+                    ErrorCode::Unsupported,
+                    "ProxyJump 主机名不能为空",
+                ));
+            }
+            if port_text
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .is_none()
+            {
+                return Err(ErrorDto::new(
+                    ErrorCode::Unsupported,
+                    "ProxyJump 端口必须是 1-65535 的数字",
+                ));
+            }
+        }
     }
     Ok(hops.join(","))
 }
@@ -431,7 +625,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
     let features = vec![
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
-        "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段2）".to_string(),
+        "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -684,7 +878,9 @@ fn known_hosts_trust(
         .find(|item| item.host_id == host_id)
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?;
 
-    let (algorithm, key_b64, fingerprint_sha256) = probe_remote_host_key(&host.address, host.port)?;
+    let proxy_jump = validate_proxy_jump(&host.proxy_jump)?;
+    let (algorithm, key_b64, fingerprint_sha256) =
+        probe_remote_host_key(&host.address, host.port, &proxy_jump)?;
     let trusted_at_ms = current_time_ms()?;
     let known_item = KnownHostItemDto {
         host_id: host.host_id.clone(),
@@ -835,6 +1031,7 @@ fn terminal_connect_ssh(
     known_hosts_manager: State<KnownHostsStoreManager>,
     vault_manager: State<VaultManager>,
     host_id: String,
+    password: Option<String>,
 ) -> Result<TerminalSessionDto, ErrorDto> {
     let _hosts_guard = hosts_manager.lock.lock();
     let hosts = load_hosts_from_disk(&app)?;
@@ -844,7 +1041,11 @@ fn terminal_connect_ssh(
         .find(|item| item.host_id == host_id)
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?;
 
-    let (algorithm, key_b64, fingerprint_sha256) = probe_remote_host_key(&host.address, host.port)?;
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let proxy_jump = validate_proxy_jump(&host.proxy_jump)?;
+    let one_time_password = prepare_one_time_password(&auth_mode, password)?;
+    let (algorithm, key_b64, fingerprint_sha256) =
+        probe_remote_host_key(&host.address, host.port, &proxy_jump)?;
 
     let _known_guard = known_hosts_manager.lock.lock();
     let known_hosts_store = load_known_hosts_from_disk(&app)?;
@@ -882,8 +1083,25 @@ fn terminal_connect_ssh(
     } else {
         "/dev/null"
     };
+    ensure_dependency("ssh", "OpenSSH 客户端")?;
     let mut cleanup_paths = Vec::new();
-    let mut cmd = CommandBuilder::new("ssh");
+    let mut cmd = if auth_mode == "password" {
+        #[cfg(not(target_os = "windows"))]
+        {
+            ensure_dependency("sshpass", "brew/apt/yum 安装 sshpass")?;
+            let mut value = CommandBuilder::new("sshpass");
+            value.arg("-e");
+            value.arg("ssh");
+            value.env("SSHPASS", one_time_password.unwrap_or_default());
+            value
+        }
+        #[cfg(target_os = "windows")]
+        {
+            CommandBuilder::new("ssh")
+        }
+    } else {
+        CommandBuilder::new("ssh")
+    };
     cmd.arg("-p");
     cmd.arg(host.port.to_string());
     cmd.arg("-o");
@@ -895,11 +1113,11 @@ fn terminal_connect_ssh(
         "UserKnownHostsFile={}",
         known_hosts_path.to_string_lossy()
     ));
-    if !host.proxy_jump.trim().is_empty() {
+    if !proxy_jump.trim().is_empty() {
         cmd.arg("-J");
-        cmd.arg(host.proxy_jump.clone());
+        cmd.arg(proxy_jump);
     }
-    match host.auth_mode.as_str() {
+    match auth_mode.as_str() {
         "key" => {
             let key_id = host
                 .key_id
@@ -916,7 +1134,15 @@ fn terminal_connect_ssh(
             cmd.arg("-o");
             cmd.arg("IdentitiesOnly=no");
         }
-        "password" | "auto" => {}
+        "password" => {
+            cmd.arg("-o");
+            cmd.arg("PreferredAuthentications=password,keyboard-interactive");
+            cmd.arg("-o");
+            cmd.arg("PubkeyAuthentication=no");
+            cmd.arg("-o");
+            cmd.arg("NumberOfPasswordPrompts=1");
+        }
+        "auto" => {}
         _ => {}
     }
     cmd.arg(format!("{}@{}", host.username, host.address));

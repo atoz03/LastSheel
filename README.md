@@ -1,7 +1,7 @@
 # LastSheel
 
 LastSheel 是一个面向 Linux 远端主机的桌面 SSH 运维工具，当前仓库已完成
-V1 里程碑 M1~M3（脚手架 + 终端 + Hosts/Vault/Store）基础能力：
+V1 里程碑 M1~M4（阶段3）基础能力：
 
 - Tauri v2 + React + TypeScript 项目骨架
 - Rust Workspace（`src-tauri` + `crates/lastsheel-core`）
@@ -12,6 +12,8 @@ V1 里程碑 M1~M3（脚手架 + 终端 + Hosts/Vault/Store）基础能力：
 - SSH 直连基础能力（Host 信任校验后发起连接）
 - known_hosts 严格策略（未知阻断、变更阻断、应用内信任）
 - SSH 认证与跳板基础能力（auto/password/key/agent + ProxyJump 最多2跳）
+- 密码认证优化（一次性密码输入 + `sshpass` 自动注入，不落盘）
+- 代理链路可观测性（`PROXY_JUMP_FAILED` + 跳板链路原因提示）
 - 统一错误码与启动配置 DTO（Rust -> 前端 Event/Command）
 - GitHub Actions 持续集成（TypeScript + Rust）
 
@@ -44,4 +46,4 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 - 已完成：里程碑 1（脚手架、基础窗口路由、CI）
 - 已完成：里程碑 2（本地终端 MVP：xterm.js + WebGL + 标签 + 分屏）
 - 已完成：里程碑 3（Hosts + Vault + Store）
-- 进行中：里程碑 4（SSH 直连 + known_hosts 严格校验，阶段2）
+- 已完成：里程碑 4 阶段3（SSH 认证补齐 + ProxyJump 可观测性）

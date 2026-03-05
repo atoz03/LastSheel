@@ -41,6 +41,7 @@ type HostItem = {
 type KeyOption = {
   key_id: string;
   name: string;
+  created_at_ms?: number;
 };
 
 type HostForm = {
@@ -56,22 +57,56 @@ type HostForm = {
   pinned: boolean;
 };
 
-function formatInvokeError(error: unknown): string {
+type InvokeErrorDto = {
+  code?: string;
+  message?: string;
+};
+
+function getInvokeError(error: unknown): { code?: string; message: string } {
   if (typeof error === "string") {
-    return error;
+    return { message: error };
   }
   if (error && typeof error === "object") {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string") {
-      return message;
+    const payload = error as InvokeErrorDto;
+    if (typeof payload.message === "string") {
+      return {
+        code: typeof payload.code === "string" ? payload.code : undefined,
+        message: payload.message,
+      };
     }
     try {
-      return JSON.stringify(error);
+      return { message: JSON.stringify(error) };
     } catch {
-      return "未知错误";
+      return { message: "未知错误" };
     }
   }
-  return String(error);
+  return { message: String(error) };
+}
+
+function formatInvokeError(error: unknown): string {
+  const payload = getInvokeError(error);
+  if (!payload.code) {
+    return payload.message;
+  }
+  return `[${payload.code}] ${payload.message}`;
+}
+
+function formatSshConnectError(error: unknown): string {
+  const payload = getInvokeError(error);
+  switch (payload.code) {
+    case "HOSTKEY_UNKNOWN":
+      return `${payload.message}（请先点击“信任指纹”）`;
+    case "HOSTKEY_CHANGED":
+      return `${payload.message}（请确认后重新信任）`;
+    case "VAULT_LOCKED":
+      return `${payload.message}（请先在 Keychain 解锁 Vault）`;
+    case "PROXY_JUMP_FAILED":
+      return `${payload.message}（请检查跳板机地址、端口与网络）`;
+    case "DEP_MISSING":
+      return `${payload.message}（请安装缺失依赖后重试）`;
+    default:
+      return payload.code ? `[${payload.code}] ${payload.message}` : payload.message;
+  }
 }
 
 function createTab(title: string, pane: TerminalPaneModel): TerminalTabModel {
@@ -197,7 +232,7 @@ export function HostsWorkspace() {
         }));
         setNotice("Host 已保存。");
       } catch (error: unknown) {
-        setNotice(`保存 Host 失败：${String(error)}`);
+        setNotice(`保存 Host 失败：${formatInvokeError(error)}`);
       }
     },
     [hostForm, loadHosts],
@@ -210,7 +245,7 @@ export function HostsWorkspace() {
         await loadHosts();
         setNotice("Host 已删除。");
       } catch (error: unknown) {
-        setNotice(`删除 Host 失败：${String(error)}`);
+        setNotice(`删除 Host 失败：${formatInvokeError(error)}`);
       }
     },
     [loadHosts],
@@ -312,9 +347,22 @@ export function HostsWorkspace() {
   }, [createTerminalPane]);
 
   const connectSshHost = useCallback(async (host: HostItem) => {
+    let oneTimePassword: string | null = null;
+    if (host.auth_mode === "password") {
+      oneTimePassword = window.prompt(`请输入 ${host.alias} 的一次性 SSH 密码（不会落盘）`, "");
+      if (oneTimePassword === null) {
+        setNotice("已取消 SSH 连接。");
+        return;
+      }
+      if (!oneTimePassword.trim()) {
+        setNotice("密码不能为空。");
+        return;
+      }
+    }
     try {
       const response = await invoke<TerminalSessionResponse>("terminal_connect_ssh", {
         hostId: host.host_id,
+        password: oneTimePassword,
       });
       const pane: TerminalPaneModel = {
         pane_id: crypto.randomUUID(),
@@ -328,7 +376,7 @@ export function HostsWorkspace() {
       });
       setNotice(`SSH 会话已创建：${host.alias}`);
     } catch (error: unknown) {
-      setNotice(`SSH 连接失败：${formatInvokeError(error)}`);
+      setNotice(`SSH 连接失败：${formatSshConnectError(error)}`);
     }
   }, []);
 
@@ -609,6 +657,7 @@ export function HostsWorkspace() {
               {keyOptions.map((item) => (
                 <option key={item.key_id} value={item.key_id}>
                   {item.name} / {item.key_id.slice(0, 8)}
+                  {item.created_at_ms ? ` / ${new Date(item.created_at_ms).toLocaleDateString()}` : ""}
                 </option>
               ))}
             </select>

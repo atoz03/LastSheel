@@ -7,6 +7,7 @@ pub enum ErrorCode {
     AuthFailed,
     HostkeyChanged,
     HostkeyUnknown,
+    ProxyJumpFailed,
     SudoRequired,
     DepMissing,
     PermissionDenied,
@@ -50,7 +51,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M4-SSH直连(阶段2)".to_string(),
+            active_milestone: "M4-SSH直连(阶段3)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
