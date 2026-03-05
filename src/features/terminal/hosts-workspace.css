@@ -386,6 +386,98 @@
   color: #8ea9d1;
 }
 
+.remote-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 8, 18, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 40;
+}
+
+.remote-editor-modal {
+  width: min(980px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid #335481;
+  border-radius: 12px;
+  padding: 12px;
+  background: #0f1b31;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.remote-editor-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-editor-header h4 {
+  margin: 0 0 4px;
+}
+
+.remote-editor-header p {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #9fb4d7;
+}
+
+.remote-editor-header button,
+.remote-editor-actions button {
+  border: 1px solid #40649f;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #d7e6ff;
+  background: #152742;
+  cursor: pointer;
+}
+
+.remote-editor-textarea {
+  width: 100%;
+  min-height: 320px;
+  border: 1px solid #335481;
+  border-radius: 8px;
+  padding: 8px;
+  color: #d8e7ff;
+  background: #101a2f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.remote-editor-diff {
+  border: 1px solid #2a3c60;
+  border-radius: 8px;
+  padding: 8px;
+  background: #101a2f;
+}
+
+.remote-editor-diff h5 {
+  margin: 0 0 6px;
+}
+
+.remote-editor-diff pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c8d8f4;
+  font-size: 0.78rem;
+}
+
+.remote-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .quicksend-list,
 .history-list {
   display: flex;

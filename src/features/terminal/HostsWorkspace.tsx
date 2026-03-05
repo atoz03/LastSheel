@@ -5,8 +5,11 @@ import { listen } from "@tauri-apps/api/event";
 import { decodeBase64ToUtf8, encodeUtf8ToBase64 } from "./encoding";
 import { TerminalPane } from "./TerminalPane";
 import type {
+  RemoteDeleteResponse,
   RemoteFileEntry,
   RemoteFileListResponse,
+  RemoteReadTextResponse,
+  RemoteWriteTextResponse,
   TerminalOutputPayload,
   TerminalPaneModel,
   TerminalSessionResponse,
@@ -81,6 +84,15 @@ type TransferItem = {
   total_bytes?: number | null;
   message?: string;
   sha256?: string;
+};
+
+type RemoteTextEditorState = {
+  host_id: string;
+  path: string;
+  original_text: string;
+  draft_text: string;
+  encoding: string;
+  mtime_ms: number;
 };
 
 function getInvokeError(error: unknown): { code?: string; message: string } {
@@ -176,6 +188,34 @@ function askConflictPolicy(defaultValue: "rename" | "overwrite" | "skip" = "rena
   return "rename";
 }
 
+function buildTextDiffPreview(originalText: string, currentText: string): string {
+  if (originalText === currentText) {
+    return "无变更";
+  }
+  const originalLines = originalText.split(/\r?\n/);
+  const currentLines = currentText.split(/\r?\n/);
+  const maxLines = Math.max(originalLines.length, currentLines.length);
+  const chunks: string[] = [];
+  for (let index = 0; index < maxLines; index += 1) {
+    const before = originalLines[index];
+    const after = currentLines[index];
+    if (before === after) {
+      continue;
+    }
+    if (before !== undefined) {
+      chunks.push(`- ${before}`);
+    }
+    if (after !== undefined) {
+      chunks.push(`+ ${after}`);
+    }
+    if (chunks.length >= 200) {
+      chunks.push("... diff 过长，仅展示前 200 行变化");
+      break;
+    }
+  }
+  return chunks.join("\n");
+}
+
 function createTab(
   title: string,
   pane: TerminalPaneModel,
@@ -222,6 +262,8 @@ export function HostsWorkspace() {
   const [checkedRemotePathsByTab, setCheckedRemotePathsByTab] = useState<Record<string, string[]>>({});
   const [transferItems, setTransferItems] = useState<TransferItem[]>([]);
   const [transferBusy, setTransferBusy] = useState(false);
+  const [remoteTextEditor, setRemoteTextEditor] = useState<RemoteTextEditorState | null>(null);
+  const [remoteTextEditorBusy, setRemoteTextEditorBusy] = useState(false);
   const inputBufferRef = useRef<Record<string, string>>({});
   const tabsRef = useRef<TerminalTabModel[]>([]);
   const passwordCacheRef = useRef<Record<string, string>>({});
@@ -792,6 +834,174 @@ export function HostsWorkspace() {
     }
   }, [activeTab, checkedRemotePathsByTab, hostById, remoteEntriesByTab, requestPasswordForHost, upsertTransferItem]);
 
+  const startBatchDelete = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法执行删除：Host 不存在。");
+      return;
+    }
+    const targets = (checkedRemotePathsByTab[activeTab.tab_id] ?? []).filter((path) => path.trim().length > 0);
+    if (targets.length === 0) {
+      setNotice("请先勾选要删除的远端文件或目录。");
+      return;
+    }
+    const preview = targets.slice(0, 5).join("\n");
+    const confirmed = window.confirm(
+      `确认删除 ${targets.length} 项？此操作不可恢复。\n\n${preview}${targets.length > 5 ? "\n..." : ""}`,
+    );
+    if (!confirmed) {
+      setNotice("已取消批量删除。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setTransferBusy(true);
+    try {
+      const response = await invoke<RemoteDeleteResponse>("fs_delete_remote", {
+        input: {
+          hostId: host.host_id,
+          paths: targets,
+          password,
+        },
+      });
+      setCheckedRemotePathsByTab((prev) => ({ ...prev, [activeTab.tab_id]: [] }));
+      setSelectedRemotePathByTab((prev) => {
+        const selected = prev[activeTab.tab_id] ?? "";
+        if (!selected || !targets.includes(selected)) {
+          return prev;
+        }
+        return { ...prev, [activeTab.tab_id]: "" };
+      });
+      setRemoteTextEditor((prev) => (prev && targets.includes(prev.path) ? null : prev));
+      await refreshActiveRemoteFiles();
+      setNotice(`删除完成：${response.deleted_count} 项。`);
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`批量删除失败：${formatInvokeError(error)}`);
+    } finally {
+      setTransferBusy(false);
+    }
+  }, [activeTab, checkedRemotePathsByTab, hostById, refreshActiveRemoteFiles, requestPasswordForHost]);
+
+  const openRemoteTextEditor = useCallback(async () => {
+    if (
+      remoteTextEditor &&
+      remoteTextEditor.draft_text !== remoteTextEditor.original_text &&
+      !window.confirm("当前编辑器有未保存变更，是否放弃并打开新文件？")
+    ) {
+      return;
+    }
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return;
+    }
+    const host = hostById.get(activeTab.host_id);
+    if (!host) {
+      setNotice("无法打开编辑器：Host 不存在。");
+      return;
+    }
+    const selectedPath = selectedRemotePathByTab[activeTab.tab_id];
+    if (!selectedPath) {
+      setNotice("请先选中一个文件。");
+      return;
+    }
+    const entry = (remoteEntriesByTab[activeTab.tab_id] ?? []).find((item) => item.path === selectedPath);
+    if (!entry || entry.entry_type === "dir") {
+      setNotice("仅文件支持在线编辑。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setRemoteTextEditorBusy(true);
+    try {
+      const response = await invoke<RemoteReadTextResponse>("fs_read_text", {
+        input: {
+          hostId: host.host_id,
+          path: entry.path,
+          maxBytes: 2_000_000,
+          password,
+        },
+      });
+      setRemoteTextEditor({
+        host_id: host.host_id,
+        path: response.path,
+        original_text: response.text,
+        draft_text: response.text,
+        encoding: response.encoding,
+        mtime_ms: response.mtime_ms,
+      });
+      setNotice("已加载远端文本文件。");
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`打开编辑器失败：${formatInvokeError(error)}`);
+    } finally {
+      setRemoteTextEditorBusy(false);
+    }
+  }, [activeTab, hostById, remoteEntriesByTab, remoteTextEditor, requestPasswordForHost, selectedRemotePathByTab]);
+
+  const closeRemoteTextEditor = useCallback(() => {
+    if (!remoteTextEditor) {
+      return;
+    }
+    if (
+      remoteTextEditor.draft_text !== remoteTextEditor.original_text &&
+      !window.confirm("当前有未保存变更，确认关闭编辑器吗？")
+    ) {
+      return;
+    }
+    setRemoteTextEditor(null);
+  }, [remoteTextEditor]);
+
+  const saveRemoteTextEditor = useCallback(async () => {
+    if (!remoteTextEditor) {
+      return;
+    }
+    const host = hostById.get(remoteTextEditor.host_id);
+    if (!host) {
+      setNotice("保存失败：Host 不存在。");
+      return;
+    }
+    const password = host.auth_mode === "password" ? requestPasswordForHost(host, false) : null;
+    if (host.auth_mode === "password" && password === null) {
+      return;
+    }
+    setRemoteTextEditorBusy(true);
+    try {
+      const response = await invoke<RemoteWriteTextResponse>("fs_write_text_atomic", {
+        input: {
+          hostId: remoteTextEditor.host_id,
+          path: remoteTextEditor.path,
+          text: remoteTextEditor.draft_text,
+          encoding: remoteTextEditor.encoding,
+          password,
+        },
+      });
+      setRemoteTextEditor(null);
+      await refreshActiveRemoteFiles();
+      setNotice(`保存完成，mtime=${new Date(response.new_mtime_ms).toLocaleString()}`);
+    } catch (error: unknown) {
+      const payload = getInvokeError(error);
+      if (payload.code === "AUTH_FAILED") {
+        delete passwordCacheRef.current[host.host_id];
+      }
+      setNotice(`保存失败：${formatInvokeError(error)}`);
+    } finally {
+      setRemoteTextEditorBusy(false);
+    }
+  }, [hostById, refreshActiveRemoteFiles, remoteTextEditor, requestPasswordForHost]);
+
   const startUpload = useCallback(async () => {
     if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
       return;
@@ -1076,6 +1286,17 @@ export function HostsWorkspace() {
   const activeCheckedRemotePaths = activeTab
     ? checkedRemotePathsByTab[activeTab.tab_id] ?? EMPTY_PATHS
     : EMPTY_PATHS;
+  const activeSelectedRemoteEntry = useMemo(
+    () => activeRemoteEntries.find((entry) => entry.path === activeSelectedRemotePath) ?? null,
+    [activeRemoteEntries, activeSelectedRemotePath],
+  );
+  const activeCheckedEntryCount = useMemo(
+    () =>
+      activeRemoteEntries.filter((entry) =>
+        activeCheckedRemotePaths.includes(entry.path),
+      ).length,
+    [activeCheckedRemotePaths, activeRemoteEntries],
+  );
   const activeDownloadableEntries = useMemo(
     () => activeRemoteEntries.filter((entry) => entry.entry_type !== "dir"),
     [activeRemoteEntries],
@@ -1087,9 +1308,18 @@ export function HostsWorkspace() {
       ).length,
     [activeCheckedRemotePaths, activeDownloadableEntries],
   );
-  const allDownloadableChecked =
-    activeDownloadableEntries.length > 0 &&
-    activeCheckedDownloadCount === activeDownloadableEntries.length;
+  const allEntriesChecked =
+    activeRemoteEntries.length > 0 &&
+    activeCheckedEntryCount === activeRemoteEntries.length;
+  const remoteTextEditorHasChanges =
+    remoteTextEditor !== null && remoteTextEditor.draft_text !== remoteTextEditor.original_text;
+  const remoteTextDiffPreview = useMemo(
+    () =>
+      remoteTextEditor
+        ? buildTextDiffPreview(remoteTextEditor.original_text, remoteTextEditor.draft_text)
+        : "",
+    [remoteTextEditor],
+  );
 
   return (
     <section className="hosts-workspace">
@@ -1335,8 +1565,7 @@ export function HostsWorkspace() {
                       transferBusy ||
                       remoteLoadingTabId === activeTab.tab_id ||
                       !activeSelectedRemotePath ||
-                      activeRemoteEntries.find((item) => item.path === activeSelectedRemotePath)?.entry_type ===
-                        "dir"
+                      activeSelectedRemoteEntry?.entry_type === "dir"
                     }
                   >
                     下载
@@ -1351,6 +1580,30 @@ export function HostsWorkspace() {
                     }
                   >
                     批量下载（{activeCheckedDownloadCount}）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void startBatchDelete()}
+                    disabled={
+                      transferBusy ||
+                      remoteLoadingTabId === activeTab.tab_id ||
+                      activeCheckedEntryCount === 0
+                    }
+                  >
+                    批量删除（{activeCheckedEntryCount}）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void openRemoteTextEditor()}
+                    disabled={
+                      remoteTextEditorBusy ||
+                      transferBusy ||
+                      remoteLoadingTabId === activeTab.tab_id ||
+                      !activeSelectedRemoteEntry ||
+                      activeSelectedRemoteEntry.entry_type === "dir"
+                    }
+                  >
+                    在线编辑
                   </button>
                 </div>
               ) : null}
@@ -1371,8 +1624,8 @@ export function HostsWorkspace() {
                         <th className="filebar-checkbox-col">
                           <input
                             type="checkbox"
-                            checked={allDownloadableChecked}
-                            disabled={activeDownloadableEntries.length === 0}
+                            checked={allEntriesChecked}
+                            disabled={activeRemoteEntries.length === 0}
                             onChange={(event) => {
                               if (!activeTab) {
                                 return;
@@ -1380,7 +1633,7 @@ export function HostsWorkspace() {
                               setCheckedRemotePathsByTab((prev) => ({
                                 ...prev,
                                 [activeTab.tab_id]: event.currentTarget.checked
-                                  ? activeDownloadableEntries.map((entry) => entry.path)
+                                  ? activeRemoteEntries.map((entry) => entry.path)
                                   : [],
                               }));
                             }}
@@ -1419,15 +1672,10 @@ export function HostsWorkspace() {
                           <td className="filebar-checkbox-col">
                             <input
                               type="checkbox"
-                              checked={
-                                entry.entry_type === "dir"
-                                  ? false
-                                  : activeCheckedRemotePaths.includes(entry.path)
-                              }
-                              disabled={entry.entry_type === "dir"}
+                              checked={activeCheckedRemotePaths.includes(entry.path)}
                               onClick={(event) => event.stopPropagation()}
                               onChange={(event) => {
-                                if (!activeTab || entry.entry_type === "dir") {
+                                if (!activeTab) {
                                   return;
                                 }
                                 const shouldCheck = event.currentTarget.checked;
@@ -1534,6 +1782,64 @@ export function HostsWorkspace() {
           </div>
         </aside>
       </div>
+      {remoteTextEditor ? (
+        <div className="remote-editor-backdrop">
+          <div className="remote-editor-modal">
+            <div className="remote-editor-header">
+              <div>
+                <h4>在线编辑</h4>
+                <p>{remoteTextEditor.path}</p>
+                <p>
+                  编码：{remoteTextEditor.encoding} · 最近修改：
+                  {formatMtime(remoteTextEditor.mtime_ms)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeRemoteTextEditor}
+                disabled={remoteTextEditorBusy}
+              >
+                关闭
+              </button>
+            </div>
+            <textarea
+              className="remote-editor-textarea"
+              value={remoteTextEditor.draft_text}
+              onChange={(event) =>
+                setRemoteTextEditor((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        draft_text: event.currentTarget.value,
+                      }
+                    : prev,
+                )
+              }
+              spellCheck={false}
+            />
+            <div className="remote-editor-diff">
+              <h5>保存前 Diff 预览</h5>
+              <pre>{remoteTextDiffPreview}</pre>
+            </div>
+            <div className="remote-editor-actions">
+              <button
+                type="button"
+                onClick={closeRemoteTextEditor}
+                disabled={remoteTextEditorBusy}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveRemoteTextEditor()}
+                disabled={remoteTextEditorBusy || !remoteTextEditorHasChanges}
+              >
+                {remoteTextEditorBusy ? "保存中..." : "保存（原子替换）"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }

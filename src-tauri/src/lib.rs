@@ -4,12 +4,13 @@ use argon2::Argon2;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use lastsheel_core::{
-    AppBootstrapDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType, FsListResponseDto,
-    HostItemDto, HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
-    TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
-    TransferDownloadInputDto, TransferStartDto, TransferState, TransferUpdateEventDto,
-    TransferUploadInputDto, TransferVerifyEventDto, TransferVerifyResultDto, TransferVerifyState,
-    VaultStatusDto,
+    AppBootstrapDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType, FsDeleteInputDto,
+    FsDeleteResultDto, FsListResponseDto, FsReadTextInputDto, FsReadTextResultDto,
+    FsWriteTextInputDto, FsWriteTextResultDto, HostItemDto, HostUpsertInputDto, KeyImportResultDto,
+    KeyMetadataDto, KnownHostItemDto, TerminalOutputEventDto, TerminalSessionDto, TerminalState,
+    TerminalStatusEventDto, TransferDownloadInputDto, TransferStartDto, TransferState,
+    TransferUpdateEventDto, TransferUploadInputDto, TransferVerifyEventDto,
+    TransferVerifyResultDto, TransferVerifyState, VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -17,7 +18,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -115,6 +116,9 @@ struct VaultFileEnvelope {
     nonce_b64: String,
     cipher_b64: String,
 }
+
+const FS_READ_TEXT_DEFAULT_MAX_BYTES: usize = 2_000_000;
+const REMOTE_DELETE_MAX_DEPTH: usize = 128;
 
 fn emit_terminal_status(
     app: &tauri::AppHandle,
@@ -702,7 +706,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
-        "文件栏与传输增强（批量下载 + 冲突策略 + SHA256 校验，阶段3）".to_string(),
+        "文件栏与传输增强（批量下载/冲突策略/SHA256 + 在线编辑与删除，阶段4）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -1278,6 +1282,216 @@ fn fs_list_remote(
     })
 }
 
+#[tauri::command]
+fn fs_delete_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: FsDeleteInputDto,
+) -> Result<FsDeleteResultDto, ErrorDto> {
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "文件操作当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let mut normalized_paths = Vec::new();
+    let mut dedup = HashSet::new();
+    for path in input.paths {
+        let trimmed = path.trim().to_string();
+        validate_remote_target_path(&trimmed)?;
+        if dedup.insert(trimmed.clone()) {
+            normalized_paths.push(trimmed);
+        }
+    }
+    if normalized_paths.is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "至少需要一个远端路径",
+        ));
+    }
+
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+    let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+
+    for path in &normalized_paths {
+        remove_remote_path_recursive(&sftp, Path::new(path), 0)?;
+    }
+
+    Ok(FsDeleteResultDto {
+        deleted_count: normalized_paths.len(),
+    })
+}
+
+#[tauri::command]
+fn fs_read_text(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: FsReadTextInputDto,
+) -> Result<FsReadTextResultDto, ErrorDto> {
+    let remote_path = input.path.trim().to_string();
+    validate_remote_target_path(&remote_path)?;
+    let max_bytes = input.max_bytes.unwrap_or(FS_READ_TEXT_DEFAULT_MAX_BYTES);
+    if max_bytes == 0 || max_bytes > 20_000_000 {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "max_bytes 取值范围为 1 到 20000000",
+        ));
+    }
+
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "文件操作当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+    let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+    let target_path = Path::new(&remote_path);
+    let stat = sftp
+        .stat(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "远端文件不存在"))?;
+    let mode = stat.perm.unwrap_or(0);
+    if matches!(entry_type_from_perm(mode), FileEntryType::Dir) {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "目录不支持文本编辑"));
+    }
+    if stat.size.unwrap_or(0) > max_bytes as u64 {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            format!("文件大小超过限制（>{max_bytes} 字节）"),
+        ));
+    }
+
+    let mut remote_file = sftp
+        .open(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端文件失败"))?;
+    let mut content = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read_size = remote_file
+            .read(&mut buffer)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端文件失败"))?;
+        if read_size == 0 {
+            break;
+        }
+        if content.len().saturating_add(read_size) > max_bytes {
+            return Err(ErrorDto::new(
+                ErrorCode::Unsupported,
+                format!("文件大小超过限制（>{max_bytes} 字节）"),
+            ));
+        }
+        content.extend_from_slice(&buffer[..read_size]);
+    }
+    let text = String::from_utf8(content)
+        .map_err(|_| ErrorDto::new(ErrorCode::Unsupported, "仅支持 UTF-8 文本文件"))?;
+
+    Ok(FsReadTextResultDto {
+        path: remote_path,
+        text,
+        encoding: "utf-8".to_string(),
+        mtime_ms: stat
+            .mtime
+            .map(|value| (value as i64).saturating_mul(1000))
+            .unwrap_or(0),
+    })
+}
+
+#[tauri::command]
+fn fs_write_text_atomic(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: FsWriteTextInputDto,
+) -> Result<FsWriteTextResultDto, ErrorDto> {
+    let remote_path = input.path.trim().to_string();
+    validate_remote_target_path(&remote_path)?;
+    let encoding = input
+        .encoding
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("utf-8")
+        .to_lowercase();
+    if encoding != "utf-8" && encoding != "utf8" {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前仅支持 utf-8 编码写入",
+        ));
+    }
+
+    let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "文件操作当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, input.password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+    let sftp = open_authenticated_sftp(&host, &prepared_auth)?;
+
+    let target_path = Path::new(&remote_path);
+    let existing_stat = sftp
+        .stat(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "远端文件不存在"))?;
+    if matches!(
+        entry_type_from_perm(existing_stat.perm.unwrap_or(0)),
+        FileEntryType::Dir
+    ) {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "目录不支持文本编辑"));
+    }
+    let target_name = target_path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "目标路径格式无效"))?;
+    let parent_dir = target_path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = parent_dir.join(format!(".{target_name}.tmp.{}", Uuid::new_v4().simple()));
+    let bytes = input.text.into_bytes();
+
+    let write_result = (|| -> Result<(), ErrorDto> {
+        let mut temp_file = sftp
+            .create(&temp_path)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端临时文件失败"))?;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "写入远端临时文件失败"))?;
+        let _ = temp_file.flush();
+        drop(temp_file);
+        sftp.rename(&temp_path, target_path, Some(ssh2::RenameFlags::OVERWRITE))
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "原子替换远端文件失败"))?;
+        Ok(())
+    })();
+
+    if let Err(error) = write_result {
+        let _ = sftp.unlink(&temp_path);
+        return Err(error);
+    }
+
+    let stat = sftp
+        .stat(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取写入结果失败"))?;
+    Ok(FsWriteTextResultDto {
+        new_mtime_ms: stat
+            .mtime
+            .map(|value| (value as i64).saturating_mul(1000))
+            .unwrap_or(0),
+    })
+}
+
 fn load_host_for_remote_operation(
     app: &tauri::AppHandle,
     hosts_manager: &State<HostsStoreManager>,
@@ -1291,6 +1505,57 @@ fn load_host_for_remote_operation(
         .find(|item| item.host_id == host_id)
         .cloned()
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))
+}
+
+fn validate_remote_target_path(path: &str) -> Result<(), ErrorDto> {
+    let value = path.trim();
+    if value.is_empty() {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "远端路径不能为空"));
+    }
+    if value == "/" || value == "." || value == ".." {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "禁止对根目录或当前目录执行此操作",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_remote_path_recursive(
+    sftp: &ssh2::Sftp,
+    target_path: &Path,
+    depth: usize,
+) -> Result<(), ErrorDto> {
+    if depth > REMOTE_DELETE_MAX_DEPTH {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "目录层级过深，已停止删除以避免误操作",
+        ));
+    }
+    let stat = sftp
+        .lstat(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "远端文件或目录不存在"))?;
+    let mode = stat.perm.unwrap_or(0);
+    if matches!(entry_type_from_perm(mode), FileEntryType::Dir) {
+        let children = sftp
+            .readdir(target_path)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端目录失败"))?;
+        for (child_path, _) in children {
+            let name = match child_path.file_name().and_then(|item| item.to_str()) {
+                Some(value) => value,
+                None => continue,
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            remove_remote_path_recursive(sftp, &target_path.join(name), depth + 1)?;
+        }
+        sftp.rmdir(target_path)
+            .map_err(|_| ErrorDto::new(ErrorCode::IoError, "删除远端目录失败"))?;
+        return Ok(());
+    }
+    sftp.unlink(target_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "删除远端文件失败"))
 }
 
 fn sanitize_path_segment(input: &str) -> String {
@@ -2185,6 +2450,9 @@ pub fn run() {
             key_import_private_key,
             key_list,
             fs_list_remote,
+            fs_delete_remote,
+            fs_read_text,
+            fs_write_text_atomic,
             transfer_download,
             transfer_upload,
             transfer_cancel,

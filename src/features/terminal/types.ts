@@ -52,6 +52,21 @@ export type RemoteFileListResponse = {
   entries: RemoteFileEntry[];
 };
 
+export type RemoteDeleteResponse = {
+  deleted_count: number;
+};
+
+export type RemoteReadTextResponse = {
+  path: string;
+  text: string;
+  encoding: string;
+  mtime_ms: number;
+};
+
+export type RemoteWriteTextResponse = {
+  new_mtime_ms: number;
+};
+
 export type TransferState = "queued" | "running" | "done" | "error" | "canceled";
 
 export type TransferUpdatePayload = {

@@ -51,7 +51,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M5-文件栏(阶段2)".to_string(),
+            active_milestone: "M5-文件栏(阶段4)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -180,6 +180,48 @@ pub struct FileEntryDto {
 pub struct FsListResponseDto {
     pub cwd: String,
     pub entries: Vec<FileEntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsDeleteInputDto {
+    pub host_id: String,
+    pub paths: Vec<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsDeleteResultDto {
+    pub deleted_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsReadTextInputDto {
+    pub host_id: String,
+    pub path: String,
+    pub max_bytes: Option<usize>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsReadTextResultDto {
+    pub path: String,
+    pub text: String,
+    pub encoding: String,
+    pub mtime_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsWriteTextInputDto {
+    pub host_id: String,
+    pub path: String,
+    pub text: String,
+    pub encoding: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsWriteTextResultDto {
+    pub new_mtime_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
