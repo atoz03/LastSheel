@@ -1,0 +1,171 @@
+:root {
+  font-family: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e5edf4;
+  background: #0f1627;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  background: radial-gradient(circle at top left, #1d2944, #0b1323 60%);
+}
+
+.global-nav {
+  width: 320px;
+  border-right: 1px solid #24324f;
+  padding: 24px 18px;
+  background: rgba(9, 16, 32, 0.85);
+}
+
+.brand-title {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.brand-subtitle {
+  margin: 8px 0 16px;
+  color: #8fa4c5;
+  font-size: 0.9rem;
+}
+
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.nav-link {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid #27395a;
+  border-radius: 10px;
+  padding: 12px;
+  text-decoration: none;
+  color: #cfe3ff;
+  transition: 0.2s ease;
+}
+
+.nav-link:hover {
+  border-color: #3f5f97;
+  transform: translateX(2px);
+}
+
+.nav-link-active {
+  border-color: #65a0ff;
+  background: rgba(60, 109, 192, 0.15);
+}
+
+.nav-label {
+  font-weight: 600;
+}
+
+.nav-description {
+  font-size: 0.83rem;
+  color: #92a8cb;
+}
+
+.content {
+  flex: 1;
+  padding: 24px;
+}
+
+.content-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  border: 1px solid #2c426d;
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  background: rgba(12, 22, 40, 0.8);
+}
+
+.content-header h2 {
+  margin: 0 0 6px;
+}
+
+.content-header p {
+  margin: 0;
+  color: #9bb2d7;
+}
+
+.build-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #b9cae4;
+  font-size: 0.92rem;
+}
+
+.feature-page {
+  border: 1px solid #2c426d;
+  border-radius: 12px;
+  padding: 20px;
+  background: rgba(12, 22, 40, 0.78);
+}
+
+.feature-page h3 {
+  margin: 0 0 8px;
+}
+
+.feature-page p {
+  margin: 0 0 10px;
+  color: #9bb2d7;
+}
+
+.feature-page ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #d2e2fb;
+}
+
+.feature-page li + li {
+  margin-top: 6px;
+}
+
+.error-banner {
+  margin: 0 0 16px;
+  border: 1px solid #9d4f4f;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(141, 31, 31, 0.2);
+  color: #ffc4c4;
+}
+
+@media (max-width: 1100px) {
+  .app-shell {
+    flex-direction: column;
+  }
+
+  .global-nav {
+    width: auto;
+    border-right: none;
+    border-bottom: 1px solid #24324f;
+  }
+
+  .content-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
