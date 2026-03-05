@@ -1,3 +1,4 @@
+import type { FormEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -21,6 +22,28 @@ const SNIPPETS = [
 ];
 
 const HISTORY_LIMIT = 500;
+const DEFAULT_PORT = 22;
+
+type HostItem = {
+  host_id: string;
+  alias: string;
+  address: string;
+  port: number;
+  username: string;
+  tags: string[];
+  note: string;
+  pinned: boolean;
+};
+
+type HostForm = {
+  alias: string;
+  address: string;
+  port: string;
+  username: string;
+  tags: string;
+  note: string;
+  pinned: boolean;
+};
 
 function createTab(title: string, pane: TerminalPaneModel): TerminalTabModel {
   const tabId = crypto.randomUUID();
@@ -39,6 +62,16 @@ export function HostsWorkspace() {
   const [history, setHistory] = useState<string[]>([]);
   const [historyKeyword, setHistoryKeyword] = useState("");
   const [notice, setNotice] = useState("按 Ctrl+Shift+T 新建标签，Ctrl+\\ 进行分屏。");
+  const [hosts, setHosts] = useState<HostItem[]>([]);
+  const [hostForm, setHostForm] = useState<HostForm>({
+    alias: "",
+    address: "",
+    port: "22",
+    username: "root",
+    tags: "",
+    note: "",
+    pinned: false,
+  });
   const inputBufferRef = useRef<Record<string, string>>({});
   const tabsRef = useRef<TerminalTabModel[]>([]);
 
@@ -52,25 +85,15 @@ export function HostsWorkspace() {
   }, [tabs]);
 
   const updatePaneStatus = useCallback(
-    (
-      terminalId: string,
-      state: TerminalPaneModel["status"],
-      message?: string,
-    ) => {
-    setTabs((prev) =>
-      prev.map((tab) => ({
-        ...tab,
-        panes: tab.panes.map((pane) =>
-          pane.terminal_id === terminalId
-            ? {
-                ...pane,
-                status: state,
-                message,
-              }
-            : pane,
-        ),
-      })),
-    );
+    (terminalId: string, state: TerminalPaneModel["status"], message?: string) => {
+      setTabs((prev) =>
+        prev.map((tab) => ({
+          ...tab,
+          panes: tab.panes.map((pane) =>
+            pane.terminal_id === terminalId ? { ...pane, status: state, message } : pane,
+          ),
+        })),
+      );
     },
     [],
   );
@@ -85,6 +108,66 @@ export function HostsWorkspace() {
       return next.slice(0, HISTORY_LIMIT);
     });
   }, []);
+
+  const loadHosts = useCallback(async () => {
+    try {
+      const response = await invoke<HostItem[]>("store_hosts_list");
+      setHosts(response);
+    } catch {
+      setNotice("Hosts 存储暂不可用，请通过 `pnpm tauri dev` 启动。");
+    }
+  }, []);
+
+  const saveHost = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const tags = hostForm.tags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+      const port = Number(hostForm.port);
+
+      try {
+        await invoke("store_hosts_upsert", {
+          input: {
+            alias: hostForm.alias,
+            address: hostForm.address,
+            port: Number.isNaN(port) ? DEFAULT_PORT : port,
+            username: hostForm.username,
+            tags,
+            note: hostForm.note,
+            pinned: hostForm.pinned,
+          },
+        });
+        await loadHosts();
+        setHostForm((prev) => ({
+          ...prev,
+          alias: "",
+          address: "",
+          tags: "",
+          note: "",
+          pinned: false,
+        }));
+        setNotice("Host 已保存。");
+      } catch (error: unknown) {
+        setNotice(`保存 Host 失败：${String(error)}`);
+      }
+    },
+    [hostForm, loadHosts],
+  );
+
+  const removeHost = useCallback(
+    async (hostId: string) => {
+      try {
+        await invoke("store_hosts_delete", { hostId });
+        await loadHosts();
+        setNotice("Host 已删除。");
+      } catch (error: unknown) {
+        setNotice(`删除 Host 失败：${String(error)}`);
+      }
+    },
+    [loadHosts],
+  );
 
   const writeTerminal = useCallback(
     async (terminalId: string, data: string) => {
@@ -153,7 +236,7 @@ export function HostsWorkspace() {
         status: "connecting",
       };
     } catch {
-      setNotice("无法启动本地终端，请确认通过 `npm run tauri dev` 运行。");
+      setNotice("无法启动本地终端，请确认通过 `pnpm tauri dev` 运行。");
       return null;
     }
   }, []);
@@ -240,6 +323,10 @@ export function HostsWorkspace() {
       void createNewTab();
     }
   }, [createNewTab, tabs.length]);
+
+  useEffect(() => {
+    void loadHosts();
+  }, [loadHosts]);
 
   useEffect(() => {
     let unlistenOutput: (() => void) | undefined;
@@ -344,10 +431,83 @@ export function HostsWorkspace() {
         <aside className="workspace-left">
           <h3>Hosts</h3>
           <ul>
-            <li>生产集群 / 10.0.0.11</li>
-            <li>测试集群 / 10.0.1.12</li>
-            <li>日志节点 / 10.0.2.21</li>
+            {hosts.map((host) => (
+              <li key={host.host_id}>
+                <div className="host-item-top">
+                  <span>{host.alias}</span>
+                  <button type="button" onClick={() => void removeHost(host.host_id)}>
+                    删除
+                  </button>
+                </div>
+                <div className="host-item-meta">
+                  {host.username}@{host.address}:{host.port}
+                </div>
+              </li>
+            ))}
+            {hosts.length === 0 ? <li>暂无 Host，请先添加。</li> : null}
           </ul>
+
+          <form className="host-form" onSubmit={(event) => void saveHost(event)}>
+            <input
+              value={hostForm.alias}
+              onChange={(event) =>
+                setHostForm((prev) => ({ ...prev, alias: event.currentTarget.value }))
+              }
+              placeholder="别名，例如 prod-api"
+              required
+            />
+            <input
+              value={hostForm.address}
+              onChange={(event) =>
+                setHostForm((prev) => ({ ...prev, address: event.currentTarget.value }))
+              }
+              placeholder="地址，例如 10.10.1.8"
+              required
+            />
+            <div className="host-form-inline">
+              <input
+                value={hostForm.username}
+                onChange={(event) =>
+                  setHostForm((prev) => ({ ...prev, username: event.currentTarget.value }))
+                }
+                placeholder="用户名"
+                required
+              />
+              <input
+                value={hostForm.port}
+                onChange={(event) =>
+                  setHostForm((prev) => ({ ...prev, port: event.currentTarget.value }))
+                }
+                placeholder="端口"
+              />
+            </div>
+            <input
+              value={hostForm.tags}
+              onChange={(event) =>
+                setHostForm((prev) => ({ ...prev, tags: event.currentTarget.value }))
+              }
+              placeholder="标签，逗号分隔"
+            />
+            <textarea
+              value={hostForm.note}
+              onChange={(event) =>
+                setHostForm((prev) => ({ ...prev, note: event.currentTarget.value }))
+              }
+              placeholder="备注"
+            />
+            <label className="host-form-pin">
+              <input
+                type="checkbox"
+                checked={hostForm.pinned}
+                onChange={(event) =>
+                  setHostForm((prev) => ({ ...prev, pinned: event.currentTarget.checked }))
+                }
+              />
+              置顶
+            </label>
+            <button type="submit">保存 Host</button>
+          </form>
+
           <h3>监控</h3>
           <p>CPU 24% · MEM 43% · Load 1.02</p>
           <p>网速 Rx 1.1MB/s · Tx 320KB/s</p>
@@ -412,7 +572,7 @@ export function HostsWorkspace() {
           </div>
 
           <div className="workspace-bottom">
-            <h4>文件栏（M2 占位）</h4>
+            <h4>文件栏（M3 占位）</h4>
             <p>将于 M5 接入 SFTP 列表、传输队列与在线编辑。</p>
           </div>
         </div>

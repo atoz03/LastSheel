@@ -50,7 +50,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M2-本地终端MVP".to_string(),
+            active_milestone: "M3-Hosts+Vault+Store".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -82,4 +82,47 @@ pub struct TerminalStatusEventDto {
     pub terminal_id: String,
     pub state: TerminalState,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostItemDto {
+    pub host_id: String,
+    pub alias: String,
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+    pub tags: Vec<String>,
+    pub note: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostUpsertInputDto {
+    pub host_id: Option<String>,
+    pub alias: String,
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+    pub tags: Vec<String>,
+    pub note: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultStatusDto {
+    pub initialized: bool,
+    pub unlocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyImportResultDto {
+    pub key_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyMetadataDto {
+    pub key_id: String,
+    pub name: String,
+    pub has_passphrase: bool,
+    pub created_at_ms: i64,
 }

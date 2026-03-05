@@ -62,6 +62,72 @@
   color: #c8d8f4;
 }
 
+.host-item-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.host-item-top button {
+  border: 1px solid #4f6e9c;
+  border-radius: 6px;
+  padding: 0 6px;
+  color: #d9e7ff;
+  background: #1c3359;
+  cursor: pointer;
+}
+
+.host-item-meta {
+  color: #8ea9d1;
+  font-size: 0.8rem;
+  margin-top: 3px;
+}
+
+.host-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.host-form input,
+.host-form textarea {
+  width: 100%;
+  border: 1px solid #335481;
+  border-radius: 8px;
+  padding: 8px;
+  color: #d8e7ff;
+  background: #111f36;
+}
+
+.host-form textarea {
+  resize: vertical;
+  min-height: 56px;
+}
+
+.host-form-inline {
+  display: grid;
+  grid-template-columns: 1fr 90px;
+  gap: 8px;
+}
+
+.host-form-pin {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.86rem;
+  color: #a8bfdf;
+}
+
+.host-form button {
+  border: 1px solid #40649f;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #d7e6ff;
+  background: #152742;
+  cursor: pointer;
+}
+
 .workspace-left p {
   margin: 0 0 8px;
   color: #9fb4d7;

@@ -1,3 +1,4 @@
+import { KeychainWorkspace } from "./features/keychain/KeychainWorkspace";
 import { HostsWorkspace } from "./features/terminal/HostsWorkspace";
 
 type FeaturePageProps = {
@@ -25,17 +26,7 @@ export function HostsPage() {
 }
 
 export function KeychainPage() {
-  return (
-    <FeaturePage
-      title="Keychain"
-      summary="本地加密管理私钥、密码与口令，支持密钥生成与部署。"
-      bullets={[
-        "支持导入私钥（含 passphrase）",
-        "支持生成 Ed25519 并复制公钥",
-        "支持一键部署公钥到 authorized_keys",
-      ]}
-    />
-  );
+  return <KeychainWorkspace />;
 }
 
 export function PortForwardingPage() {
