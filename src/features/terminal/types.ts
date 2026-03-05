@@ -15,6 +15,8 @@ export type TerminalSessionResponse = {
   terminal_id: string;
 };
 
+export type TerminalTabKind = "local" | "ssh";
+
 export type TerminalPaneModel = {
   pane_id: string;
   terminal_id: string;
@@ -27,4 +29,25 @@ export type TerminalTabModel = {
   title: string;
   panes: TerminalPaneModel[];
   active_pane_id: string;
+  tab_kind: TerminalTabKind;
+  host_id?: string;
+  host_alias?: string;
+};
+
+export type RemoteFileEntryType = "file" | "dir" | "symlink" | "unknown";
+
+export type RemoteFileEntry = {
+  name: string;
+  path: string;
+  entry_type: RemoteFileEntryType;
+  size_bytes: number;
+  mtime_ms: number;
+  mode_octal: string;
+  uid: number;
+  gid: number;
+};
+
+export type RemoteFileListResponse = {
+  cwd: string;
+  entries: RemoteFileEntry[];
 };

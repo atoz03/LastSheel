@@ -5,6 +5,8 @@ import { listen } from "@tauri-apps/api/event";
 import { decodeBase64ToUtf8, encodeUtf8ToBase64 } from "./encoding";
 import { TerminalPane } from "./TerminalPane";
 import type {
+  RemoteFileEntry,
+  RemoteFileListResponse,
   TerminalOutputPayload,
   TerminalPaneModel,
   TerminalSessionResponse,
@@ -109,13 +111,40 @@ function formatSshConnectError(error: unknown): string {
   }
 }
 
-function createTab(title: string, pane: TerminalPaneModel): TerminalTabModel {
+function formatFileSize(sizeBytes: number): string {
+  if (sizeBytes >= 1024 * 1024 * 1024) {
+    return `${(sizeBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+  if (sizeBytes >= 1024 * 1024) {
+    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (sizeBytes >= 1024) {
+    return `${(sizeBytes / 1024).toFixed(1)} KB`;
+  }
+  return `${sizeBytes} B`;
+}
+
+function formatMtime(timestampMs: number): string {
+  if (timestampMs <= 0) {
+    return "-";
+  }
+  return new Date(timestampMs).toLocaleString();
+}
+
+function createTab(
+  title: string,
+  pane: TerminalPaneModel,
+  options: { tabKind: "local" | "ssh"; hostId?: string; hostAlias?: string },
+): TerminalTabModel {
   const tabId = crypto.randomUUID();
   return {
     tab_id: tabId,
     title,
     panes: [pane],
     active_pane_id: pane.pane_id,
+    tab_kind: options.tabKind,
+    host_id: options.hostId,
+    host_alias: options.hostAlias,
   };
 }
 
@@ -140,13 +169,28 @@ export function HostsWorkspace() {
     pinned: false,
   });
   const [keyOptions, setKeyOptions] = useState<KeyOption[]>([]);
+  const [remoteEntriesByTab, setRemoteEntriesByTab] = useState<Record<string, RemoteFileEntry[]>>({});
+  const [remoteCwdByTab, setRemoteCwdByTab] = useState<Record<string, string>>({});
+  const [remotePathInputByTab, setRemotePathInputByTab] = useState<Record<string, string>>({});
+  const [remoteLoadingTabId, setRemoteLoadingTabId] = useState<string | null>(null);
   const inputBufferRef = useRef<Record<string, string>>({});
   const tabsRef = useRef<TerminalTabModel[]>([]);
+  const passwordCacheRef = useRef<Record<string, string>>({});
 
   const activeTab = useMemo(
     () => tabs.find((tab) => tab.tab_id === activeTabId) ?? null,
     [activeTabId, tabs],
   );
+  const hostById = useMemo(
+    () => new Map(hosts.map((host) => [host.host_id, host])),
+    [hosts],
+  );
+  const activeSshHost = useMemo(() => {
+    if (!activeTab || activeTab.tab_kind !== "ssh" || !activeTab.host_id) {
+      return null;
+    }
+    return hostById.get(activeTab.host_id) ?? null;
+  }, [activeTab, hostById]);
 
   useEffect(() => {
     tabsRef.current = tabs;
@@ -339,7 +383,7 @@ export function HostsWorkspace() {
     }
     setTabs((prev) => {
       const title = `本地会话 ${prev.length + 1}`;
-      const tab = createTab(title, pane);
+      const tab = createTab(title, pane, { tabKind: "local" });
       setActiveTabId(tab.tab_id);
       return [...prev, tab];
     });
@@ -358,6 +402,7 @@ export function HostsWorkspace() {
         setNotice("密码不能为空。");
         return;
       }
+      passwordCacheRef.current[host.host_id] = oneTimePassword;
     }
     try {
       const response = await invoke<TerminalSessionResponse>("terminal_connect_ssh", {
@@ -370,7 +415,11 @@ export function HostsWorkspace() {
         status: "connecting",
       };
       setTabs((prev) => {
-        const tab = createTab(`SSH:${host.alias}`, pane);
+        const tab = createTab(`SSH:${host.alias}`, pane, {
+          tabKind: "ssh",
+          hostId: host.host_id,
+          hostAlias: host.alias,
+        });
         setActiveTabId(tab.tab_id);
         return [...prev, tab];
       });
@@ -441,6 +490,94 @@ export function HostsWorkspace() {
       await writeTerminal(pane.terminal_id, `${line}\r`);
     },
     [activeTab, writeTerminal],
+  );
+
+  const requestPasswordForHost = useCallback((host: HostItem, forcePrompt: boolean): string | null => {
+    if (host.auth_mode !== "password") {
+      return null;
+    }
+    if (!forcePrompt) {
+      const cached = passwordCacheRef.current[host.host_id];
+      if (cached) {
+        return cached;
+      }
+    }
+    const value = window.prompt(`请输入 ${host.alias} 的一次性 SSH 密码（不会落盘）`, "");
+    if (value === null) {
+      return null;
+    }
+    if (!value.trim()) {
+      setNotice("密码不能为空。");
+      return null;
+    }
+    passwordCacheRef.current[host.host_id] = value;
+    return value;
+  }, []);
+
+  const loadRemoteFilesForTab = useCallback(
+    async (tab: TerminalTabModel, targetPath?: string, forcePasswordPrompt = false) => {
+      if (tab.tab_kind !== "ssh" || !tab.host_id) {
+        return;
+      }
+      const host = hostById.get(tab.host_id);
+      if (!host) {
+        setNotice("无法读取远端文件：Host 已不存在。");
+        return;
+      }
+      if (host.proxy_jump.trim()) {
+        setRemoteEntriesByTab((prev) => ({ ...prev, [tab.tab_id]: [] }));
+        setRemoteCwdByTab((prev) => ({ ...prev, [tab.tab_id]: "-" }));
+        return;
+      }
+
+      const password =
+        host.auth_mode === "password" ? requestPasswordForHost(host, forcePasswordPrompt) : null;
+      if (host.auth_mode === "password" && password === null) {
+        setRemoteEntriesByTab((prev) =>
+          Object.prototype.hasOwnProperty.call(prev, tab.tab_id) ? prev : { ...prev, [tab.tab_id]: [] },
+        );
+        return;
+      }
+
+      setRemoteLoadingTabId(tab.tab_id);
+      try {
+        const response = await invoke<RemoteFileListResponse>("fs_list_remote", {
+          hostId: host.host_id,
+          path: targetPath?.trim() ? targetPath.trim() : null,
+          password,
+        });
+        setRemoteEntriesByTab((prev) => ({ ...prev, [tab.tab_id]: response.entries }));
+        setRemoteCwdByTab((prev) => ({ ...prev, [tab.tab_id]: response.cwd }));
+        setRemotePathInputByTab((prev) => ({ ...prev, [tab.tab_id]: response.cwd }));
+      } catch (error: unknown) {
+        const payload = getInvokeError(error);
+        if (payload.code === "AUTH_FAILED") {
+          delete passwordCacheRef.current[host.host_id];
+        }
+        setNotice(`文件列表加载失败：${formatInvokeError(error)}`);
+      } finally {
+        setRemoteLoadingTabId((prev) => (prev === tab.tab_id ? null : prev));
+      }
+    },
+    [hostById, requestPasswordForHost],
+  );
+
+  const refreshActiveRemoteFiles = useCallback(async () => {
+    if (!activeTab || activeTab.tab_kind !== "ssh") {
+      return;
+    }
+    const preferredPath = remotePathInputByTab[activeTab.tab_id] ?? remoteCwdByTab[activeTab.tab_id] ?? ".";
+    await loadRemoteFilesForTab(activeTab, preferredPath);
+  }, [activeTab, loadRemoteFilesForTab, remoteCwdByTab, remotePathInputByTab]);
+
+  const openRemoteDirectory = useCallback(
+    async (entry: RemoteFileEntry) => {
+      if (!activeTab || activeTab.tab_kind !== "ssh") {
+        return;
+      }
+      await loadRemoteFilesForTab(activeTab, entry.path);
+    },
+    [activeTab, loadRemoteFilesForTab],
   );
 
   useEffect(() => {
@@ -531,6 +668,38 @@ export function HostsWorkspace() {
     };
   }, [closeTerminal]);
 
+  useEffect(() => {
+    if (!activeTab || activeTab.tab_kind !== "ssh") {
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(remoteEntriesByTab, activeTab.tab_id)) {
+      return;
+    }
+    void loadRemoteFilesForTab(activeTab);
+  }, [activeTab, loadRemoteFilesForTab, remoteEntriesByTab]);
+
+  useEffect(() => {
+    const validTabIds = new Set(tabs.map((tab) => tab.tab_id));
+    setRemoteEntriesByTab((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([tabId]) => validTabIds.has(tabId)),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
+    setRemoteCwdByTab((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([tabId]) => validTabIds.has(tabId)),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
+    setRemotePathInputByTab((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([tabId]) => validTabIds.has(tabId)),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
+  }, [tabs]);
+
   const filteredHistory = useMemo(() => {
     const keyword = historyKeyword.trim().toLowerCase();
     if (!keyword) {
@@ -538,6 +707,9 @@ export function HostsWorkspace() {
     }
     return history.filter((line) => line.toLowerCase().includes(keyword));
   }, [history, historyKeyword]);
+  const activeRemoteEntries = activeTab ? remoteEntriesByTab[activeTab.tab_id] ?? [] : [];
+  const activeRemoteCwd = activeTab ? remoteCwdByTab[activeTab.tab_id] ?? "-" : "-";
+  const activeRemotePathInput = activeTab ? remotePathInputByTab[activeTab.tab_id] ?? "" : "";
 
   return (
     <section className="hosts-workspace">
@@ -752,8 +924,78 @@ export function HostsWorkspace() {
           </div>
 
           <div className="workspace-bottom">
-            <h4>文件栏（M3 占位）</h4>
-            <p>将于 M5 接入 SFTP 列表、传输队列与在线编辑。</p>
+            <div className="filebar-header">
+              <h4>文件栏</h4>
+              {activeTab?.tab_kind === "ssh" ? (
+                <div className="filebar-actions">
+                  <input
+                    value={activeRemotePathInput}
+                    onChange={(event) =>
+                      setRemotePathInputByTab((prev) => ({
+                        ...prev,
+                        [activeTab.tab_id]: event.currentTarget.value,
+                      }))
+                    }
+                    placeholder="输入远端路径，例如 /var/log"
+                  />
+                  <button type="button" onClick={() => void refreshActiveRemoteFiles()}>
+                    {remoteLoadingTabId === activeTab.tab_id ? "加载中..." : "刷新"}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {activeTab?.tab_kind !== "ssh" ? (
+              <p>当前为本地会话，文件栏仅在 SSH 会话中可用。</p>
+            ) : activeSshHost?.proxy_jump ? (
+              <p>当前主机使用 ProxyJump，文件栏暂仅支持直连主机。</p>
+            ) : (
+              <>
+                <p>
+                  Host：{activeSshHost?.alias ?? activeTab.host_alias ?? "-"} · 当前目录：{activeRemoteCwd}
+                </p>
+                <div className="filebar-table-wrap">
+                  <table className="filebar-table">
+                    <thead>
+                      <tr>
+                        <th>名称</th>
+                        <th>类型</th>
+                        <th>大小</th>
+                        <th>权限</th>
+                        <th>UID/GID</th>
+                        <th>修改时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeRemoteEntries.map((entry) => (
+                        <tr
+                          key={entry.path}
+                          className={entry.entry_type === "dir" ? "file-row-dir" : undefined}
+                          onDoubleClick={() =>
+                            entry.entry_type === "dir" ? void openRemoteDirectory(entry) : undefined
+                          }
+                        >
+                          <td>{entry.name}</td>
+                          <td>{entry.entry_type}</td>
+                          <td>{entry.entry_type === "dir" ? "-" : formatFileSize(entry.size_bytes)}</td>
+                          <td>{entry.mode_octal}</td>
+                          <td>
+                            {entry.uid}/{entry.gid}
+                          </td>
+                          <td>{formatMtime(entry.mtime_ms)}</td>
+                        </tr>
+                      ))}
+                      {activeRemoteEntries.length === 0 && remoteLoadingTabId !== activeTab.tab_id ? (
+                        <tr>
+                          <td colSpan={6} className="filebar-empty">
+                            暂无文件或目录
+                          </td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </div>
         </div>
 

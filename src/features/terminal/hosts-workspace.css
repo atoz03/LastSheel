@@ -218,16 +218,95 @@
   border-top: 1px solid #2a3c60;
   padding: 10px 14px;
   background: #101a2f;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .workspace-bottom h4 {
-  margin: 0 0 6px;
+  margin: 0;
 }
 
 .workspace-bottom p {
   margin: 0;
   color: #9fb4d7;
   font-size: 0.9rem;
+}
+
+.filebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.filebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filebar-actions input {
+  min-width: 280px;
+  border: 1px solid #335481;
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: #d8e7ff;
+  background: #111f36;
+}
+
+.filebar-actions button {
+  border: 1px solid #40649f;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #d7e6ff;
+  background: #152742;
+  cursor: pointer;
+}
+
+.filebar-table-wrap {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid #2a3c60;
+  border-radius: 8px;
+}
+
+.filebar-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.filebar-table th,
+.filebar-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #22385f;
+  text-align: left;
+  color: #c8d8f4;
+}
+
+.filebar-table th {
+  position: sticky;
+  top: 0;
+  background: #142541;
+  color: #d8e7ff;
+}
+
+.filebar-table tbody tr:hover {
+  background: rgba(89, 134, 206, 0.12);
+}
+
+.file-row-dir {
+  cursor: pointer;
+}
+
+.file-row-dir td:first-child::before {
+  content: "📁 ";
+}
+
+.filebar-empty {
+  text-align: center;
+  color: #8ea9d1;
 }
 
 .quicksend-list,

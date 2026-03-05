@@ -4,9 +4,10 @@ use argon2::Argon2;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use lastsheel_core::{
-    AppBootstrapDto, ErrorCode, ErrorDto, HostItemDto, HostUpsertInputDto, KeyImportResultDto,
-    KeyMetadataDto, KnownHostItemDto, TerminalOutputEventDto, TerminalSessionDto, TerminalState,
-    TerminalStatusEventDto, VaultStatusDto,
+    AppBootstrapDto, ErrorCode, ErrorDto, FileEntryDto, FileEntryType, FsListResponseDto,
+    HostItemDto, HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
+    TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
+    VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -17,6 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
@@ -626,6 +628,7 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
+        "文件栏 SFTP 目录列表（阶段1）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -907,6 +910,265 @@ fn known_hosts_trust(
     Ok(known_item)
 }
 
+fn ensure_known_host_trusted(
+    app: &tauri::AppHandle,
+    known_hosts_manager: &State<KnownHostsStoreManager>,
+    host: &HostItemDto,
+) -> Result<(), ErrorDto> {
+    let proxy_jump = validate_proxy_jump(&host.proxy_jump)?;
+    let (algorithm, key_b64, fingerprint_sha256) =
+        probe_remote_host_key(&host.address, host.port, &proxy_jump)?;
+    let _known_guard = known_hosts_manager.lock.lock();
+    let known_hosts_store = load_known_hosts_from_disk(app)?;
+    let known = known_hosts_store
+        .items
+        .iter()
+        .find(|item| item.address == host.address && item.port == host.port);
+
+    match known {
+        None => Err(ErrorDto::new(
+            ErrorCode::HostkeyUnknown,
+            format!(
+                "未知主机指纹：{}，请先在 Known Hosts 页面信任该主机",
+                fingerprint_sha256
+            ),
+        )),
+        Some(item) => {
+            if item.key_b64 != key_b64 || item.algorithm != algorithm {
+                return Err(ErrorDto::new(
+                    ErrorCode::HostkeyChanged,
+                    format!(
+                        "主机指纹变化：旧={} 新={}",
+                        item.fingerprint_sha256, fingerprint_sha256
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn load_private_key_for_auth(
+    vault_manager: &State<VaultManager>,
+    key_id: &str,
+) -> Result<(String, Option<String>), ErrorDto> {
+    let runtime = vault_manager.runtime.lock();
+    if !runtime.unlocked {
+        return Err(ErrorDto::new(
+            ErrorCode::VaultLocked,
+            "使用密钥认证前请先解锁 Vault",
+        ));
+    }
+    let key = runtime
+        .data
+        .keys
+        .iter()
+        .find(|item| item.key_id == key_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "找不到指定的密钥"))?;
+    Ok((key.pem_text.clone(), key.passphrase.clone()))
+}
+
+fn authenticate_sftp_session(
+    session: &mut ssh2::Session,
+    host: &HostItemDto,
+    auth_mode: &str,
+    password: Option<String>,
+    vault_manager: &State<VaultManager>,
+) -> Result<(), ErrorDto> {
+    match auth_mode {
+        "key" => {
+            let key_id = host
+                .key_id
+                .as_ref()
+                .ok_or_else(|| ErrorDto::new(ErrorCode::Unsupported, "当前 Host 未配置密钥"))?;
+            let (pem_text, passphrase) = load_private_key_for_auth(vault_manager, key_id)?;
+            session
+                .userauth_pubkey_memory(
+                    &host.username,
+                    None,
+                    pem_text.as_str(),
+                    passphrase.as_deref(),
+                )
+                .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "密钥认证失败"))?;
+        }
+        "password" => {
+            let plain = password.ok_or_else(|| {
+                ErrorDto::new(ErrorCode::AuthFailed, "密码认证需要输入一次性密码")
+            })?;
+            session
+                .userauth_password(&host.username, plain.as_str())
+                .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "密码认证失败"))?;
+        }
+        "agent" => {
+            session
+                .userauth_agent(&host.username)
+                .map_err(|_| ErrorDto::new(ErrorCode::AuthFailed, "Agent 认证失败"))?;
+        }
+        _ => {
+            if let Some(key_id) = &host.key_id {
+                if let Ok((pem_text, passphrase)) = load_private_key_for_auth(vault_manager, key_id)
+                {
+                    if session
+                        .userauth_pubkey_memory(
+                            &host.username,
+                            None,
+                            pem_text.as_str(),
+                            passphrase.as_deref(),
+                        )
+                        .is_ok()
+                        && session.authenticated()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            if session.userauth_agent(&host.username).is_ok() && session.authenticated() {
+                return Ok(());
+            }
+            if let Some(plain) = password {
+                if session
+                    .userauth_password(&host.username, plain.as_str())
+                    .is_ok()
+                    && session.authenticated()
+                {
+                    return Ok(());
+                }
+            }
+            return Err(ErrorDto::new(
+                ErrorCode::AuthFailed,
+                "自动认证失败，请改用明确认证方式",
+            ));
+        }
+    }
+
+    if !session.authenticated() {
+        return Err(ErrorDto::new(ErrorCode::AuthFailed, "SSH 认证失败"));
+    }
+    Ok(())
+}
+
+fn entry_type_from_perm(mode: u32) -> FileEntryType {
+    match mode & 0o170000 {
+        0o040000 => FileEntryType::Dir,
+        0o100000 => FileEntryType::File,
+        0o120000 => FileEntryType::Symlink,
+        _ => FileEntryType::Unknown,
+    }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn read_remote_dir_entries(
+    sftp: &ssh2::Sftp,
+    cwd_path: &Path,
+) -> Result<Vec<FileEntryDto>, ErrorDto> {
+    let raw_entries = sftp
+        .readdir(cwd_path)
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "读取远端目录失败"))?;
+    let mut entries = Vec::new();
+    for (path, stat) in raw_entries {
+        let name = match path.file_name().and_then(|item| item.to_str()) {
+            Some(value) => value.to_string(),
+            None => continue,
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let mode = stat.perm.unwrap_or(0);
+        let entry_path = cwd_path.join(&name);
+        entries.push(FileEntryDto {
+            name,
+            path: path_to_string(&entry_path),
+            entry_type: entry_type_from_perm(mode),
+            size_bytes: stat.size.unwrap_or(0),
+            mtime_ms: stat
+                .mtime
+                .map(|value| (value as i64).saturating_mul(1000))
+                .unwrap_or(0),
+            mode_octal: format!("{:04o}", mode & 0o7777),
+            uid: stat.uid.unwrap_or(0),
+            gid: stat.gid.unwrap_or(0),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        let left_dir = matches!(left.entry_type, FileEntryType::Dir);
+        let right_dir = matches!(right.entry_type, FileEntryType::Dir);
+        match right_dir.cmp(&left_dir) {
+            std::cmp::Ordering::Equal => left
+                .name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.name.cmp(&right.name)),
+            other => other,
+        }
+    });
+    Ok(entries)
+}
+
+#[tauri::command]
+fn fs_list_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    host_id: String,
+    path: Option<String>,
+    password: Option<String>,
+) -> Result<FsListResponseDto, ErrorDto> {
+    let _hosts_guard = hosts_manager.lock.lock();
+    let hosts = load_hosts_from_disk(&app)?;
+    let host = hosts
+        .items
+        .iter()
+        .find(|item| item.host_id == host_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?
+        .clone();
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "文件栏当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, password)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
+
+    let tcp = TcpStream::connect((host.address.as_str(), host.port))
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "连接远端 SSH 端口失败"))?;
+    let mut session =
+        ssh2::Session::new().map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建 SSH 会话失败"))?;
+    session.set_tcp_stream(tcp);
+    session
+        .handshake()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "SSH 握手失败"))?;
+    authenticate_sftp_session(
+        &mut session,
+        &host,
+        &auth_mode,
+        one_time_password,
+        &vault_manager,
+    )?;
+    let sftp = session
+        .sftp()
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "初始化 SFTP 通道失败"))?;
+    let requested_path = path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    let cwd_path = sftp
+        .realpath(Path::new(&requested_path))
+        .map_err(|_| ErrorDto::new(ErrorCode::NotFound, "目标路径不存在或不可访问"))?;
+    let entries = read_remote_dir_entries(&sftp, &cwd_path)?;
+    Ok(FsListResponseDto {
+        cwd: path_to_string(&cwd_path),
+        entries,
+    })
+}
+
 fn spawn_terminal_with_command(
     app: &tauri::AppHandle,
     manager: &State<TerminalManager>,
@@ -1044,38 +1306,7 @@ fn terminal_connect_ssh(
     let auth_mode = normalize_auth_mode(&host.auth_mode);
     let proxy_jump = validate_proxy_jump(&host.proxy_jump)?;
     let one_time_password = prepare_one_time_password(&auth_mode, password)?;
-    let (algorithm, key_b64, fingerprint_sha256) =
-        probe_remote_host_key(&host.address, host.port, &proxy_jump)?;
-
-    let _known_guard = known_hosts_manager.lock.lock();
-    let known_hosts_store = load_known_hosts_from_disk(&app)?;
-    let known = known_hosts_store
-        .items
-        .iter()
-        .find(|item| item.address == host.address && item.port == host.port);
-
-    match known {
-        None => {
-            return Err(ErrorDto::new(
-                ErrorCode::HostkeyUnknown,
-                format!(
-                    "未知主机指纹：{}，请先在 Known Hosts 页面信任该主机",
-                    fingerprint_sha256
-                ),
-            ));
-        }
-        Some(item) => {
-            if item.key_b64 != key_b64 || item.algorithm != algorithm {
-                return Err(ErrorDto::new(
-                    ErrorCode::HostkeyChanged,
-                    format!(
-                        "主机指纹变化：旧={} 新={}",
-                        item.fingerprint_sha256, fingerprint_sha256
-                    ),
-                ));
-            }
-        }
-    }
+    ensure_known_host_trusted(&app, &known_hosts_manager, host)?;
 
     let known_hosts_path = known_hosts_ssh_path(&app)?;
     let null_known_hosts = if cfg!(target_os = "windows") {
@@ -1248,6 +1479,7 @@ pub fn run() {
             vault_lock,
             key_import_private_key,
             key_list,
+            fs_list_remote,
             terminal_spawn_local,
             terminal_connect_ssh,
             terminal_write,

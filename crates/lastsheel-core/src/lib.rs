@@ -51,7 +51,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M4-SSH直连(阶段3)".to_string(),
+            active_milestone: "M5-文件栏(阶段1)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -153,4 +153,31 @@ pub struct KnownHostItemDto {
     pub key_b64: String,
     pub fingerprint_sha256: String,
     pub trusted_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryType {
+    File,
+    Dir,
+    Symlink,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntryDto {
+    pub name: String,
+    pub path: String,
+    pub entry_type: FileEntryType,
+    pub size_bytes: u64,
+    pub mtime_ms: i64,
+    pub mode_octal: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListResponseDto {
+    pub cwd: String,
+    pub entries: Vec<FileEntryDto>,
 }
