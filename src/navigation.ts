@@ -6,6 +6,7 @@ export type NavItem = {
 
 export const NAV_ITEMS: NavItem[] = [
   { path: "/hosts", label: "Hosts", description: "会话树与连接入口" },
+  { path: "/system", label: "System", description: "进程与 systemctl 管理" },
   { path: "/keychain", label: "Keychain", description: "密钥与口令管理" },
   { path: "/port-forwarding", label: "Port Forwarding", description: "L/R/D 转发管理" },
   { path: "/snippets", label: "Snippets", description: "快速发送与模板" },

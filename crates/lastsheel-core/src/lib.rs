@@ -51,7 +51,7 @@ impl AppBootstrapDto {
         Self {
             product_name: "LastSheel".to_string(),
             version: version.into(),
-            active_milestone: "M5-文件栏(阶段4)".to_string(),
+            active_milestone: "M7-进程与服务(阶段1)".to_string(),
             default_download_dir: default_download_dir.into(),
             features,
         }
@@ -61,6 +61,32 @@ impl AppBootstrapDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSessionDto {
     pub terminal_id: String,
+    pub connection_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSubscribeInputDto {
+    pub connection_id: String,
+    pub profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSubscribeResultDto {
+    pub subscription_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSetPathProbeInputDto {
+    pub subscription_id: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorUpdateEventDto {
+    pub connection_id: String,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub payload_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +248,83 @@ pub struct FsWriteTextInputDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsWriteTextResultDto {
     pub new_mtime_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessListInputDto {
+    pub host_id: String,
+    pub password: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessItemDto {
+    pub pid: u32,
+    pub user: String,
+    pub cpu_pct: f64,
+    pub mem_pct: f64,
+    pub stat: String,
+    pub elapsed: String,
+    pub command: String,
+    pub command_line: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessListResultDto {
+    pub sampled_at_ms: i64,
+    pub items: Vec<ProcessItemDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSignalInputDto {
+    pub host_id: String,
+    pub password: Option<String>,
+    pub pid: u32,
+    pub signal: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessActionResultDto {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceListInputDto {
+    pub host_id: String,
+    pub password: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceItemDto {
+    pub unit: String,
+    pub load_state: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceListResultDto {
+    pub supported: bool,
+    pub sampled_at_ms: i64,
+    pub message: Option<String>,
+    pub items: Vec<ServiceItemDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceActionInputDto {
+    pub host_id: String,
+    pub password: Option<String>,
+    pub unit: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceActionResultDto {
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

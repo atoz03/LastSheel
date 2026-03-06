@@ -1,7 +1,7 @@
 # LastSheel
 
 LastSheel 是一个面向 Linux 远端主机的桌面 SSH 运维工具，当前仓库已完成
-V1 里程碑 M1~M5（阶段4 进行中）基础能力：
+V1 里程碑 M1~M5 与 M6 阶段1 基础能力：
 
 - Tauri v2 + React + TypeScript 项目骨架
 - Rust Workspace（`src-tauri` + `crates/lastsheel-core`）
@@ -17,8 +17,9 @@ V1 里程碑 M1~M5（阶段4 进行中）基础能力：
 - 文件栏首期能力（SSH 会话下远端目录 SFTP 列表、路径切换与双击进入目录）
 - 传输队列增强（上传/下载冲突策略、批量下载、SHA256 校验）
 - 高级文件操作首批能力（批量删除、在线编辑、保存前 Diff 预览、原子替换写回）
-- 远端压缩下载（tar.gz / zip 打包流式下载到本地传输队列）
-- 压缩包上传增强（上传后远端自动解压，支持 tar.gz / zip）
+- 远端压缩下载（tar.gz / tar / tar.bz2 / tar.xz / zip 打包流式下载到本地传输队列）
+- 压缩包上传增强（上传后远端自动解压，支持原地/新目录/自定义目录策略）
+- 左侧监控面板增强（CPU/内存/网速曲线、磁盘挂载条形图、路径探测、活动连接采样优化）
 - 统一错误码与启动配置 DTO（Rust -> 前端 Event/Command）
 - GitHub Actions 持续集成（TypeScript + Rust）
 
@@ -53,4 +54,4 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 - 已完成：里程碑 3（Hosts + Vault + Store）
 - 已完成：里程碑 4 阶段3（SSH 认证补齐 + ProxyJump 可观测性）
 - 已完成：里程碑 5 阶段3（传输校验 + 冲突策略 + 批量操作）
-- 进行中：里程碑 5 阶段4（高级文件操作、压缩流与在线编辑）
+- 进行中：里程碑 7 阶段1（进程管理、systemctl 服务管理、直连主机运维动作）

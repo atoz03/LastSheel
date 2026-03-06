@@ -8,16 +8,20 @@ use lastsheel_core::{
     FsDeleteInputDto, FsDeleteResultDto, FsListResponseDto, FsReadTextInputDto,
     FsReadTextResultDto, FsWriteTextInputDto, FsWriteTextResultDto, HostItemDto,
     HostUpsertInputDto, KeyImportResultDto, KeyMetadataDto, KnownHostItemDto,
-    TerminalOutputEventDto, TerminalSessionDto, TerminalState, TerminalStatusEventDto,
-    TransferDownloadInputDto, TransferStartDto, TransferState, TransferUpdateEventDto,
-    TransferUploadInputDto, TransferVerifyEventDto, TransferVerifyResultDto, TransferVerifyState,
-    VaultStatusDto,
+    MonitorSetPathProbeInputDto, MonitorSubscribeInputDto, MonitorSubscribeResultDto,
+    MonitorUpdateEventDto, ProcessActionResultDto, ProcessItemDto, ProcessListInputDto,
+    ProcessListResultDto, ProcessSignalInputDto, ServiceActionInputDto, ServiceActionResultDto,
+    ServiceItemDto, ServiceListInputDto, ServiceListResultDto, TerminalOutputEventDto,
+    TerminalSessionDto, TerminalState, TerminalStatusEventDto, TransferDownloadInputDto,
+    TransferStartDto, TransferState, TransferUpdateEventDto, TransferUploadInputDto,
+    TransferVerifyEventDto, TransferVerifyResultDto, TransferVerifyState, VaultStatusDto,
 };
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -28,7 +32,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -77,6 +81,31 @@ struct TransferManager {
     records: Mutex<HashMap<String, TransferRecord>>,
 }
 
+#[derive(Clone)]
+struct SshConnectionContext {
+    connection_id: String,
+    host: HostItemDto,
+    prepared_auth: PreparedSshAuth,
+}
+
+#[derive(Default)]
+struct SshConnectionManager {
+    connections: Mutex<HashMap<String, SshConnectionContext>>,
+    terminal_to_connection: Mutex<HashMap<String, String>>,
+}
+
+struct MonitorSubscriptionControl {
+    connection_id: String,
+    profile: String,
+    canceled: Arc<AtomicBool>,
+    path_probe_paths: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct MonitorManager {
+    items: Mutex<HashMap<String, MonitorSubscriptionControl>>,
+}
+
 #[derive(Default)]
 struct VaultRuntime {
     initialized: bool,
@@ -120,6 +149,7 @@ struct VaultFileEnvelope {
 
 const FS_READ_TEXT_DEFAULT_MAX_BYTES: usize = 2_000_000;
 const REMOTE_DELETE_MAX_DEPTH: usize = 128;
+const MONITOR_PATH_PROBE_MAX_PATHS: usize = 10;
 
 fn emit_terminal_status(
     app: &tauri::AppHandle,
@@ -171,6 +201,23 @@ fn emit_transfer_verify(
             state,
             sha256,
             message,
+        },
+    );
+}
+
+fn emit_monitor_update(
+    app: &tauri::AppHandle,
+    connection_id: &str,
+    kind: &str,
+    payload_json: String,
+) {
+    let _ = app.emit(
+        "monitor.update",
+        MonitorUpdateEventDto {
+            connection_id: connection_id.to_string(),
+            ts_ms: current_time_ms().unwrap_or(0),
+            kind: kind.to_string(),
+            payload_json,
         },
     );
 }
@@ -312,6 +359,45 @@ fn compact_stderr(stderr: &str) -> String {
     }
     let truncated: String = one_line.chars().take(120).collect();
     format!("{truncated}...")
+}
+
+fn quote_posix_shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn classify_management_command_error(stderr: &str, error_prefix: &str) -> ErrorDto {
+    let detail = compact_stderr(stderr);
+    let lower = detail.to_lowercase();
+    if lower.contains("__systemctl_unsupported__") || lower.contains("command not found") {
+        return ErrorDto::new(
+            ErrorCode::DepMissing,
+            format!("{error_prefix}：远端缺少 systemctl，当前主机可能不是 systemd 环境"),
+        );
+    }
+    if lower.contains("authentication is required")
+        || lower.contains("interactive authentication required")
+        || lower.contains("access denied")
+        || lower.contains("polkit")
+    {
+        return ErrorDto::new(
+            ErrorCode::SudoRequired,
+            format!("{error_prefix}：当前操作需要 sudo 或 systemd 授权"),
+        );
+    }
+    if lower.contains("operation not permitted") || lower.contains("permission denied") {
+        return ErrorDto::new(
+            ErrorCode::PermissionDenied,
+            format!("{error_prefix}：{detail}"),
+        );
+    }
+    if lower.contains("no such process")
+        || lower.contains("not loaded")
+        || lower.contains("could not be found")
+        || lower.contains("not found")
+    {
+        return ErrorDto::new(ErrorCode::NotFound, format!("{error_prefix}：{detail}"));
+    }
+    ErrorDto::new(ErrorCode::IoError, format!("{error_prefix}：{detail}"))
 }
 
 fn classify_hostkey_probe_error(
@@ -473,10 +559,13 @@ fn normalize_archive_format(input: Option<&str>, default_value: &str) -> Result<
         .as_str()
     {
         "tar_gz" | "tgz" => Ok("tar_gz".to_string()),
+        "tar" => Ok("tar".to_string()),
+        "tar_bz2" | "tbz2" | "tbz" => Ok("tar_bz2".to_string()),
+        "tar_xz" | "txz" => Ok("tar_xz".to_string()),
         "zip" => Ok("zip".to_string()),
         _ => Err(ErrorDto::new(
             ErrorCode::Unsupported,
-            "当前仅支持 tar_gz 或 zip 压缩格式",
+            "当前仅支持 tar_gz / tar / tar_bz2 / tar_xz / zip 压缩格式",
         )),
     }
 }
@@ -724,7 +813,9 @@ fn app_get_bootstrap(app: tauri::AppHandle) -> Result<AppBootstrapDto, ErrorDto>
         "本地终端 PTY（xterm.js + WebGL）".to_string(),
         "Hosts + Vault + Store 基础能力".to_string(),
         "SSH 直连 + known_hosts 严格校验 + 认证与 ProxyJump（阶段3）".to_string(),
-        "文件栏与传输增强（批量下载/压缩下载/冲突策略/SHA256 + 在线编辑与删除，阶段4）".to_string(),
+        "文件栏与传输增强（批量下载/多格式压缩流/自动解压目录策略/SHA256 + 在线编辑与删除，阶段4-4）".to_string(),
+        "监控会话仪表板（概览卡片/趋势图/路径探测/活动连接采样优化，阶段3）".to_string(),
+        "进程管理 + systemctl 服务控制（阶段1）".to_string(),
     ];
 
     Ok(AppBootstrapDto::new(
@@ -1193,6 +1284,347 @@ fn open_authenticated_session(
     Ok(session)
 }
 
+fn register_ssh_connection(
+    manager: &State<SshConnectionManager>,
+    terminal_id: &str,
+    host: HostItemDto,
+    prepared_auth: PreparedSshAuth,
+) -> String {
+    let connection_id = Uuid::new_v4().to_string();
+    manager.connections.lock().insert(
+        connection_id.clone(),
+        SshConnectionContext {
+            connection_id: connection_id.clone(),
+            host,
+            prepared_auth,
+        },
+    );
+    manager
+        .terminal_to_connection
+        .lock()
+        .insert(terminal_id.to_string(), connection_id.clone());
+    connection_id
+}
+
+fn get_ssh_connection(
+    manager: &State<SshConnectionManager>,
+    connection_id: &str,
+) -> Result<SshConnectionContext, ErrorDto> {
+    manager
+        .connections
+        .lock()
+        .get(connection_id)
+        .cloned()
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "SSH 连接上下文不存在或已失效"))
+}
+
+fn cancel_monitor_subscriptions_for_connection(
+    monitor_manager: &State<MonitorManager>,
+    connection_id: &str,
+) {
+    let mut items = monitor_manager.items.lock();
+    let target_ids = items
+        .iter()
+        .filter_map(|(subscription_id, item)| {
+            if item.connection_id == connection_id {
+                Some(subscription_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for subscription_id in target_ids {
+        if let Some(item) = items.remove(&subscription_id) {
+            item.canceled.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn cleanup_ssh_connection(
+    app: &tauri::AppHandle,
+    ssh_connection_manager: &State<SshConnectionManager>,
+    monitor_manager: &State<MonitorManager>,
+    terminal_id: &str,
+) {
+    let connection_id = ssh_connection_manager
+        .terminal_to_connection
+        .lock()
+        .remove(terminal_id);
+    if let Some(connection_id) = connection_id {
+        ssh_connection_manager
+            .connections
+            .lock()
+            .remove(&connection_id);
+        cancel_monitor_subscriptions_for_connection(monitor_manager, &connection_id);
+        let _ = app.emit("monitor.connection_closed", connection_id);
+    }
+}
+
+fn run_remote_command_collect(
+    host: &HostItemDto,
+    prepared_auth: &PreparedSshAuth,
+    command: &str,
+    error_prefix: &str,
+) -> Result<(String, String, i32), ErrorDto> {
+    let session = open_authenticated_session(host, prepared_auth)?;
+    let mut channel = session.channel_session().map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：创建远端命令通道失败"),
+        )
+    })?;
+    channel.exec(command).map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：启动远端命令失败"),
+        )
+    })?;
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    let _ = channel.read_to_string(&mut stdout_text);
+    let _ = channel.stderr().read_to_string(&mut stderr_text);
+    channel.wait_close().map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：等待远端命令结束失败"),
+        )
+    })?;
+    let status = channel.exit_status().unwrap_or(1);
+    Ok((stdout_text, stderr_text, status))
+}
+
+fn run_remote_command_capture(
+    host: &HostItemDto,
+    prepared_auth: &PreparedSshAuth,
+    command: &str,
+    error_prefix: &str,
+) -> Result<String, ErrorDto> {
+    let (stdout_text, stderr_text, status) =
+        run_remote_command_collect(host, prepared_auth, command, error_prefix)?;
+    if status == 0 {
+        return Ok(stdout_text);
+    }
+    let detail = compact_stderr(&stderr_text);
+    Err(ErrorDto::new(
+        ErrorCode::IoError,
+        format!("{error_prefix}：{detail}"),
+    ))
+}
+
+fn build_process_list_command(limit: usize) -> String {
+    format!(
+        "ps -eo pid=,user=,pcpu=,pmem=,stat=,etime=,comm=,args= --sort=-pcpu | awk 'NR<={limit} {{ pid=$1; user=$2; cpu=$3; mem=$4; stat=$5; etime=$6; comm=$7; $1=$2=$3=$4=$5=$6=$7=\"\"; sub(/^ +/, \"\", $0); printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", pid, user, cpu, mem, stat, etime, comm, $0 }}'"
+    )
+}
+
+fn parse_process_list_payload(raw: &str) -> Vec<ProcessItemDto> {
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let columns = trimmed.splitn(8, '\t').collect::<Vec<_>>();
+            if columns.len() != 8 {
+                return None;
+            }
+            Some(ProcessItemDto {
+                pid: columns[0].trim().parse::<u32>().ok()?,
+                user: columns[1].trim().to_string(),
+                cpu_pct: columns[2].trim().parse::<f64>().ok().unwrap_or(0.0),
+                mem_pct: columns[3].trim().parse::<f64>().ok().unwrap_or(0.0),
+                stat: columns[4].trim().to_string(),
+                elapsed: columns[5].trim().to_string(),
+                command: columns[6].trim().to_string(),
+                command_line: if columns[7].trim().is_empty() {
+                    columns[6].trim().to_string()
+                } else {
+                    columns[7].trim().to_string()
+                },
+            })
+        })
+        .collect()
+}
+
+fn build_service_list_command(limit: usize) -> String {
+    format!(
+        "if ! command -v systemctl >/dev/null 2>&1; then printf '__SYSTEMCTL_UNSUPPORTED__'; exit 0; fi; systemctl list-units --type=service --all --no-legend --no-pager --plain --full | awk 'NR<={limit} {{ unit=$1; load=$2; active=$3; sub=$4; $1=$2=$3=$4=\"\"; sub(/^ +/, \"\", $0); printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", unit, load, active, sub, $0 }}'"
+    )
+}
+
+fn parse_service_list_payload(raw: &str) -> Result<ServiceListResultDto, ErrorDto> {
+    if raw.trim() == "__SYSTEMCTL_UNSUPPORTED__" {
+        return Ok(ServiceListResultDto {
+            supported: false,
+            sampled_at_ms: current_time_ms().unwrap_or(0),
+            message: Some("远端未安装 systemctl，或当前主机不是 systemd 环境".to_string()),
+            items: Vec::new(),
+        });
+    }
+    let items = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let columns = trimmed.splitn(5, '\t').collect::<Vec<_>>();
+            if columns.len() != 5 {
+                return None;
+            }
+            Some(ServiceItemDto {
+                unit: columns[0].trim().to_string(),
+                load_state: columns[1].trim().to_string(),
+                active_state: columns[2].trim().to_string(),
+                sub_state: columns[3].trim().to_string(),
+                description: columns[4].trim().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(ServiceListResultDto {
+        supported: true,
+        sampled_at_ms: current_time_ms().unwrap_or(0),
+        message: None,
+        items,
+    })
+}
+
+fn normalize_process_signal(signal: &str) -> Result<&'static str, ErrorDto> {
+    match signal.trim().to_uppercase().as_str() {
+        "TERM" => Ok("TERM"),
+        "KILL" => Ok("KILL"),
+        "HUP" => Ok("HUP"),
+        "INT" => Ok("INT"),
+        _ => Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前仅支持 TERM / KILL / HUP / INT 信号",
+        )),
+    }
+}
+
+fn validate_systemd_unit_name(unit: &str) -> Result<String, ErrorDto> {
+    let trimmed = unit.trim();
+    if trimmed.is_empty() {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "服务名不能为空"));
+    }
+    if trimmed
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || "._-@:".contains(char))
+    {
+        return Ok(trimmed.to_string());
+    }
+    Err(ErrorDto::new(
+        ErrorCode::Unsupported,
+        "服务名格式非法，仅允许字母、数字与 . _ - @ :",
+    ))
+}
+
+fn normalize_service_action(action: &str) -> Result<&'static str, ErrorDto> {
+    match action.trim().to_lowercase().as_str() {
+        "start" => Ok("start"),
+        "stop" => Ok("stop"),
+        "restart" => Ok("restart"),
+        "reload" => Ok("reload"),
+        _ => Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前仅支持 start / stop / restart / reload",
+        )),
+    }
+}
+
+fn monitor_profile_interval(profile: &str) -> Duration {
+    match profile {
+        "basic" => Duration::from_secs(1),
+        _ => Duration::from_secs(5),
+    }
+}
+
+fn split_monitor_sections(text: &str) -> HashMap<String, String> {
+    let mut sections = HashMap::new();
+    let mut current_key: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = line
+            .strip_prefix("__MONITOR_")
+            .and_then(|value| value.strip_suffix("__"))
+        {
+            if let Some(key) = current_key.take() {
+                sections.insert(key, current_lines.join("\n"));
+                current_lines.clear();
+            }
+            current_key = Some(name.to_string());
+            continue;
+        }
+        current_lines.push(line.to_string());
+    }
+    if let Some(key) = current_key {
+        sections.insert(key, current_lines.join("\n"));
+    }
+    sections
+}
+
+fn parse_proc_key_values(text: &str) -> HashMap<String, u64> {
+    let mut values = HashMap::new();
+    for line in text.lines() {
+        if let Some((key, raw_value)) = line.split_once(':') {
+            let numeric = raw_value
+                .split_whitespace()
+                .find_map(|item| item.parse::<u64>().ok());
+            if let Some(value) = numeric {
+                values.insert(key.trim().to_string(), value);
+            }
+        }
+    }
+    values
+}
+
+fn build_basic_monitor_command() -> String {
+    [
+        "printf '__MONITOR_STAT__\\n'",
+        "cat /proc/stat",
+        "printf '__MONITOR_MEM__\\n'",
+        "cat /proc/meminfo",
+        "printf '__MONITOR_LOAD__\\n'",
+        "cat /proc/loadavg",
+        "printf '__MONITOR_UPTIME__\\n'",
+        "cat /proc/uptime",
+        "printf '__MONITOR_NET__\\n'",
+        "cat /proc/net/dev",
+    ]
+    .join("; ")
+}
+
+fn build_disk_monitor_command() -> String {
+    "df -kPT".to_string()
+}
+
+fn build_path_probe_command(paths: &[String]) -> Result<String, ErrorDto> {
+    if paths.len() > MONITOR_PATH_PROBE_MAX_PATHS {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            format!("路径探测最多支持 {} 个路径", MONITOR_PATH_PROBE_MAX_PATHS),
+        ));
+    }
+    let mut commands = Vec::new();
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let escaped = escape_shell_arg(trimmed);
+        commands.push(format!(
+            "path={escaped}; exists=0; readable=0; writable=0; mount=''; avail=''; total=''; if [ -e \"$path\" ]; then exists=1; fi; if [ -r \"$path\" ]; then readable=1; fi; if [ -w \"$path\" ]; then writable=1; fi; if [ \"$exists\" = \"1\" ]; then set -- $(df -kP \"$path\" 2>/dev/null | tail -n 1); total=$2; avail=$4; mount=$6; fi; printf '__PATH__\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \"$path\" \"$exists\" \"$readable\" \"$writable\" \"$mount\" \"$avail\" \"$total\""
+        ));
+    }
+    if commands.is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "至少需要一个路径探测目标",
+        ));
+    }
+    Ok(commands.join("; "))
+}
+
 fn open_authenticated_sftp(
     host: &HostItemDto,
     prepared_auth: &PreparedSshAuth,
@@ -1262,6 +1694,337 @@ fn read_remote_dir_entries(
         }
     });
     Ok(entries)
+}
+
+fn validate_monitor_profile(input: &str) -> Result<String, ErrorDto> {
+    match input.trim().to_lowercase().as_str() {
+        "disk" => Ok("disk".to_string()),
+        "path_probe" => Ok("path_probe".to_string()),
+        "basic" | "" => Ok("basic".to_string()),
+        _ => Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "监控 profile 仅支持 basic / disk / path_probe",
+        )),
+    }
+}
+
+fn sample_basic_monitor_payload(
+    raw_text: &str,
+    prev_cpu: &mut Option<(u64, u64)>,
+    prev_net: &mut HashMap<String, (u64, u64)>,
+    prev_ts_ms: &mut Option<i64>,
+) -> Result<String, ErrorDto> {
+    let sections = split_monitor_sections(raw_text);
+    let stat_text = sections
+        .get("STAT")
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "远端未返回 /proc/stat"))?;
+    let mem_text = sections
+        .get("MEM")
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "远端未返回 /proc/meminfo"))?;
+    let load_text = sections
+        .get("LOAD")
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "远端未返回 /proc/loadavg"))?;
+    let uptime_text = sections
+        .get("UPTIME")
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "远端未返回 /proc/uptime"))?;
+    let net_text = sections
+        .get("NET")
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "远端未返回 /proc/net/dev"))?;
+
+    let cpu_line = stat_text
+        .lines()
+        .find(|line| line.starts_with("cpu "))
+        .ok_or_else(|| ErrorDto::new(ErrorCode::IoError, "无法解析 CPU 统计信息"))?;
+    let cpu_parts = cpu_line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|item| item.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    if cpu_parts.len() < 4 {
+        return Err(ErrorDto::new(ErrorCode::IoError, "CPU 统计字段不足"));
+    }
+    let total_cpu = cpu_parts.iter().sum::<u64>();
+    let idle_cpu = cpu_parts[3].saturating_add(cpu_parts.get(4).copied().unwrap_or(0));
+    let cpu_total_pct = if let Some((prev_total_cpu, prev_idle_cpu)) = prev_cpu.take() {
+        let total_delta = total_cpu.saturating_sub(prev_total_cpu);
+        let idle_delta = idle_cpu.saturating_sub(prev_idle_cpu);
+        if total_delta > 0 {
+            ((total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64) * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    *prev_cpu = Some((total_cpu, idle_cpu));
+
+    let proc_values = parse_proc_key_values(mem_text);
+    let mem_total_kb = proc_values.get("MemTotal").copied().unwrap_or(0);
+    let mem_available_kb = proc_values.get("MemAvailable").copied().unwrap_or(0);
+    let mem_cached_kb = proc_values.get("Cached").copied().unwrap_or(0);
+    let swap_total_kb = proc_values.get("SwapTotal").copied().unwrap_or(0);
+    let swap_free_kb = proc_values.get("SwapFree").copied().unwrap_or(0);
+    let mem_used_kb = mem_total_kb.saturating_sub(mem_available_kb);
+    let swap_used_kb = swap_total_kb.saturating_sub(swap_free_kb);
+
+    let load_parts = load_text.split_whitespace().collect::<Vec<_>>();
+    let load1 = load_parts
+        .first()
+        .and_then(|item| item.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let load5 = load_parts
+        .get(1)
+        .and_then(|item| item.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let load15 = load_parts
+        .get(2)
+        .and_then(|item| item.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let uptime_s = uptime_text
+        .split_whitespace()
+        .next()
+        .and_then(|item| item.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    let now_ts_ms = current_time_ms()?;
+    let elapsed_seconds = prev_ts_ms
+        .map(|value| (now_ts_ms.saturating_sub(value) as f64 / 1000.0).max(1.0))
+        .unwrap_or(1.0);
+    *prev_ts_ms = Some(now_ts_ms);
+
+    let mut net_items = Vec::new();
+    for line in net_text.lines().skip(2) {
+        let Some((ifname_raw, values_raw)) = line.split_once(':') else {
+            continue;
+        };
+        let ifname = ifname_raw.trim();
+        let values = values_raw.split_whitespace().collect::<Vec<_>>();
+        if values.len() < 16 {
+            continue;
+        }
+        let rx_total = values[0].parse::<u64>().unwrap_or(0);
+        let tx_total = values[8].parse::<u64>().unwrap_or(0);
+        let (rx_rate, tx_rate) = if let Some((prev_rx, prev_tx)) = prev_net.get(ifname).copied() {
+            (
+                rx_total.saturating_sub(prev_rx) as f64 / elapsed_seconds,
+                tx_total.saturating_sub(prev_tx) as f64 / elapsed_seconds,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        prev_net.insert(ifname.to_string(), (rx_total, tx_total));
+        net_items.push(json!({
+            "ifname": ifname,
+            "rx_bytes_per_s": rx_rate,
+            "tx_bytes_per_s": tx_rate,
+            "rx_total_bytes": rx_total,
+            "tx_total_bytes": tx_total,
+        }));
+    }
+
+    serde_json::to_string(&json!({
+        "cpu_total_pct": cpu_total_pct,
+        "load1": load1,
+        "load5": load5,
+        "load15": load15,
+        "mem_total_kb": mem_total_kb,
+        "mem_used_kb": mem_used_kb,
+        "mem_cached_kb": mem_cached_kb,
+        "swap_total_kb": swap_total_kb,
+        "swap_used_kb": swap_used_kb,
+        "uptime_s": uptime_s,
+        "net": net_items,
+    }))
+    .map_err(|_| ErrorDto::new(ErrorCode::IoError, "序列化基础监控数据失败"))
+}
+
+fn sample_disk_monitor_payload(raw_text: &str) -> Result<String, ErrorDto> {
+    let mut mounts = Vec::new();
+    for line in raw_text.lines().skip(1) {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 7 {
+            continue;
+        }
+        let used_pct = parts[5].trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+        mounts.push(json!({
+            "device": parts[0],
+            "fstype": parts[1],
+            "total_bytes": parts[2].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            "used_bytes": parts[3].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            "avail_bytes": parts[4].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            "used_pct": used_pct,
+            "mount": parts[6],
+        }));
+    }
+    serde_json::to_string(&json!({ "mounts": mounts }))
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "序列化磁盘监控数据失败"))
+}
+
+fn sample_path_probe_payload(raw_text: &str) -> Result<String, ErrorDto> {
+    let mut paths = Vec::new();
+    for line in raw_text.lines() {
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() < 8 || parts[0] != "__PATH__" {
+            continue;
+        }
+        paths.push(json!({
+            "path": parts[1],
+            "exists": parts[2] == "1",
+            "readable": parts[3] == "1",
+            "writable": parts[4] == "1",
+            "mount": if parts[5].is_empty() { serde_json::Value::Null } else { json!(parts[5]) },
+            "avail_bytes": parts[6].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            "total_bytes": parts[7].parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            "dir_size_bytes": serde_json::Value::Null,
+        }));
+    }
+    serde_json::to_string(&json!({ "paths": paths }))
+        .map_err(|_| ErrorDto::new(ErrorCode::IoError, "序列化路径探测数据失败"))
+}
+
+#[tauri::command]
+fn monitor_subscribe(
+    app: tauri::AppHandle,
+    ssh_connection_manager: State<SshConnectionManager>,
+    monitor_manager: State<MonitorManager>,
+    input: MonitorSubscribeInputDto,
+) -> Result<MonitorSubscribeResultDto, ErrorDto> {
+    let profile = validate_monitor_profile(&input.profile)?;
+    let connection = get_ssh_connection(&ssh_connection_manager, &input.connection_id)?;
+    if !connection.host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "监控当前仅支持直连主机，暂不支持 ProxyJump",
+        ));
+    }
+    let subscription_id = Uuid::new_v4().to_string();
+    let canceled = Arc::new(AtomicBool::new(false));
+    let path_probe_paths = Arc::new(Mutex::new(vec![
+        ".".to_string(),
+        "/var/log".to_string(),
+        "/tmp".to_string(),
+    ]));
+    monitor_manager.items.lock().insert(
+        subscription_id.clone(),
+        MonitorSubscriptionControl {
+            connection_id: connection.connection_id.clone(),
+            profile: profile.clone(),
+            canceled: canceled.clone(),
+            path_probe_paths: path_probe_paths.clone(),
+        },
+    );
+
+    let app_handle = app.clone();
+    let connection_id = connection.connection_id.clone();
+    thread::spawn(move || {
+        let mut prev_cpu: Option<(u64, u64)> = None;
+        let mut prev_net: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut prev_ts_ms: Option<i64> = None;
+        loop {
+            if canceled.load(Ordering::Relaxed) {
+                break;
+            }
+            let sample_result = match profile.as_str() {
+                "disk" => run_remote_command_capture(
+                    &connection.host,
+                    &connection.prepared_auth,
+                    &build_disk_monitor_command(),
+                    "采集磁盘监控",
+                )
+                .and_then(|raw| sample_disk_monitor_payload(&raw)),
+                "path_probe" => {
+                    let paths = path_probe_paths.lock().clone();
+                    build_path_probe_command(&paths).and_then(|command| {
+                        run_remote_command_capture(
+                            &connection.host,
+                            &connection.prepared_auth,
+                            &command,
+                            "采集路径探测监控",
+                        )
+                        .and_then(|raw| sample_path_probe_payload(&raw))
+                    })
+                }
+                _ => run_remote_command_capture(
+                    &connection.host,
+                    &connection.prepared_auth,
+                    &build_basic_monitor_command(),
+                    "采集基础监控",
+                )
+                .and_then(|raw| {
+                    sample_basic_monitor_payload(
+                        &raw,
+                        &mut prev_cpu,
+                        &mut prev_net,
+                        &mut prev_ts_ms,
+                    )
+                }),
+            };
+            match sample_result {
+                Ok(payload_json) => {
+                    emit_monitor_update(&app_handle, &connection_id, &profile, payload_json)
+                }
+                Err(error) => emit_monitor_update(
+                    &app_handle,
+                    &connection_id,
+                    &profile,
+                    json!({ "error": error.message }).to_string(),
+                ),
+            }
+            thread::sleep(monitor_profile_interval(&profile));
+        }
+    });
+
+    Ok(MonitorSubscribeResultDto { subscription_id })
+}
+
+#[tauri::command]
+fn monitor_unsubscribe(
+    monitor_manager: State<MonitorManager>,
+    subscription_id: String,
+) -> Result<(), ErrorDto> {
+    let item = monitor_manager.items.lock().remove(&subscription_id);
+    if let Some(item) = item {
+        item.canceled.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+    Err(ErrorDto::new(ErrorCode::NotFound, "监控订阅不存在"))
+}
+
+#[tauri::command]
+fn monitor_set_path_probe(
+    monitor_manager: State<MonitorManager>,
+    input: MonitorSetPathProbeInputDto,
+) -> Result<(), ErrorDto> {
+    let items = monitor_manager.items.lock();
+    let item = items
+        .get(&input.subscription_id)
+        .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "监控订阅不存在"))?;
+    if item.profile != "path_probe" {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前订阅不是路径探测 profile",
+        ));
+    }
+    let next_paths = input
+        .paths
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if next_paths.is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "至少需要一个路径探测目标",
+        ));
+    }
+    if next_paths.len() > MONITOR_PATH_PROBE_MAX_PATHS {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            format!("路径探测最多支持 {} 个路径", MONITOR_PATH_PROBE_MAX_PATHS),
+        ));
+    }
+    *item.path_probe_paths.lock() = next_paths;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1518,6 +2281,139 @@ fn fs_write_text_atomic(
     })
 }
 
+#[tauri::command]
+fn process_list_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: ProcessListInputDto,
+) -> Result<ProcessListResultDto, ErrorDto> {
+    let (host, prepared_auth) = prepare_remote_command_context(
+        &app,
+        &hosts_manager,
+        &known_hosts_manager,
+        &vault_manager,
+        &input.host_id,
+        input.password,
+        "进程管理",
+    )?;
+    let limit = input.limit.unwrap_or(60).clamp(1, 200);
+    let raw = run_remote_command_capture(
+        &host,
+        &prepared_auth,
+        &build_process_list_command(limit),
+        "拉取进程列表",
+    )?;
+    Ok(ProcessListResultDto {
+        sampled_at_ms: current_time_ms().unwrap_or(0),
+        items: parse_process_list_payload(&raw),
+    })
+}
+
+#[tauri::command]
+fn process_signal_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: ProcessSignalInputDto,
+) -> Result<ProcessActionResultDto, ErrorDto> {
+    if input.pid == 0 {
+        return Err(ErrorDto::new(ErrorCode::Unsupported, "PID 必须大于 0"));
+    }
+    let signal = normalize_process_signal(&input.signal)?;
+    let (host, prepared_auth) = prepare_remote_command_context(
+        &app,
+        &hosts_manager,
+        &known_hosts_manager,
+        &vault_manager,
+        &input.host_id,
+        input.password,
+        "进程管理",
+    )?;
+    let (_, stderr_text, status) = run_remote_command_collect(
+        &host,
+        &prepared_auth,
+        &format!("kill -s {signal} {}", input.pid),
+        "执行进程信号",
+    )?;
+    if status != 0 {
+        return Err(classify_management_command_error(
+            &stderr_text,
+            "执行进程信号",
+        ));
+    }
+    Ok(ProcessActionResultDto {
+        ok: true,
+        message: format!("已向进程 {} 发送 {signal} 信号", input.pid),
+    })
+}
+
+#[tauri::command]
+fn service_list_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: ServiceListInputDto,
+) -> Result<ServiceListResultDto, ErrorDto> {
+    let (host, prepared_auth) = prepare_remote_command_context(
+        &app,
+        &hosts_manager,
+        &known_hosts_manager,
+        &vault_manager,
+        &input.host_id,
+        input.password,
+        "服务管理",
+    )?;
+    let limit = input.limit.unwrap_or(80).clamp(1, 200);
+    let raw = run_remote_command_capture(
+        &host,
+        &prepared_auth,
+        &build_service_list_command(limit),
+        "拉取 systemctl 服务列表",
+    )?;
+    parse_service_list_payload(&raw)
+}
+
+#[tauri::command]
+fn service_action_remote(
+    app: tauri::AppHandle,
+    hosts_manager: State<HostsStoreManager>,
+    known_hosts_manager: State<KnownHostsStoreManager>,
+    vault_manager: State<VaultManager>,
+    input: ServiceActionInputDto,
+) -> Result<ServiceActionResultDto, ErrorDto> {
+    let action = normalize_service_action(&input.action)?;
+    let unit = validate_systemd_unit_name(&input.unit)?;
+    let (host, prepared_auth) = prepare_remote_command_context(
+        &app,
+        &hosts_manager,
+        &known_hosts_manager,
+        &vault_manager,
+        &input.host_id,
+        input.password,
+        "服务管理",
+    )?;
+    let command = format!(
+        "command -v systemctl >/dev/null 2>&1 || {{ printf '__SYSTEMCTL_UNSUPPORTED__' >&2; exit 127; }}; systemctl {action} {}",
+        quote_posix_shell_arg(&unit),
+    );
+    let (_, stderr_text, status) =
+        run_remote_command_collect(&host, &prepared_auth, &command, "执行服务动作")?;
+    if status != 0 {
+        return Err(classify_management_command_error(
+            &stderr_text,
+            "执行服务动作",
+        ));
+    }
+    Ok(ServiceActionResultDto {
+        ok: true,
+        message: format!("已执行 {action}：{unit}"),
+    })
+}
+
 fn load_host_for_remote_operation(
     app: &tauri::AppHandle,
     hosts_manager: &State<HostsStoreManager>,
@@ -1531,6 +2427,29 @@ fn load_host_for_remote_operation(
         .find(|item| item.host_id == host_id)
         .cloned()
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))
+}
+
+fn prepare_remote_command_context(
+    app: &tauri::AppHandle,
+    hosts_manager: &State<HostsStoreManager>,
+    known_hosts_manager: &State<KnownHostsStoreManager>,
+    vault_manager: &State<VaultManager>,
+    host_id: &str,
+    password: Option<String>,
+    operation_name: &str,
+) -> Result<(HostItemDto, PreparedSshAuth), ErrorDto> {
+    let host = load_host_for_remote_operation(app, hosts_manager, host_id)?;
+    if !host.proxy_jump.trim().is_empty() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            format!("{operation_name}当前仅支持直连主机，暂不支持 ProxyJump"),
+        ));
+    }
+    let auth_mode = normalize_auth_mode(&host.auth_mode);
+    let one_time_password = prepare_one_time_password(&auth_mode, password)?;
+    let prepared_auth = prepare_sftp_auth(&host, &auth_mode, one_time_password, vault_manager)?;
+    ensure_known_host_trusted(app, known_hosts_manager, &host)?;
+    Ok((host, prepared_auth))
 }
 
 fn validate_remote_target_path(path: &str) -> Result<(), ErrorDto> {
@@ -1729,6 +2648,9 @@ fn escape_shell_arg(value: &str) -> String {
 
 fn archive_extension(archive_format: &str) -> &'static str {
     match archive_format {
+        "tar" => "tar",
+        "tar_bz2" => "tar.bz2",
+        "tar_xz" => "tar.xz",
         "zip" => "zip",
         _ => "tar.gz",
     }
@@ -1753,10 +2675,56 @@ fn detect_archive_format_from_path(path: &str) -> Option<&'static str> {
     if normalized.ends_with(".tar.gz") || normalized.ends_with(".tgz") {
         return Some("tar_gz");
     }
+    if normalized.ends_with(".tar.bz2")
+        || normalized.ends_with(".tbz2")
+        || normalized.ends_with(".tbz")
+    {
+        return Some("tar_bz2");
+    }
+    if normalized.ends_with(".tar.xz") || normalized.ends_with(".txz") {
+        return Some("tar_xz");
+    }
+    if normalized.ends_with(".tar") {
+        return Some("tar");
+    }
     if normalized.ends_with(".zip") {
         return Some("zip");
     }
     None
+}
+
+fn strip_archive_extension(file_name: &str) -> String {
+    let normalized = file_name.trim().to_lowercase();
+    for suffix in [
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".tar", ".zip",
+    ] {
+        if normalized.ends_with(suffix) {
+            return file_name[..file_name.len().saturating_sub(suffix.len())].to_string();
+        }
+    }
+    file_name.to_string()
+}
+
+fn default_extract_destination(remote_archive_path: &str) -> String {
+    let remote_path = Path::new(remote_archive_path);
+    let parent = remote_path
+        .parent()
+        .map(path_to_string)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    let file_name = remote_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("archive");
+    let directory_name = strip_archive_extension(file_name);
+    if directory_name.trim().is_empty() {
+        return parent;
+    }
+    if parent == "." {
+        directory_name
+    } else {
+        format!("{parent}/{directory_name}")
+    }
 }
 
 fn build_remote_archive_command(paths: &[String], archive_format: &str) -> String {
@@ -1766,6 +2734,9 @@ fn build_remote_archive_command(paths: &[String], archive_format: &str) -> Strin
         .collect::<Vec<_>>()
         .join(" ");
     match archive_format {
+        "tar" => format!("tar -cf - -- {escaped_paths}"),
+        "tar_bz2" => format!("tar -cjf - -- {escaped_paths}"),
+        "tar_xz" => format!("tar -cJf - -- {escaped_paths}"),
         "zip" => format!("zip -qry - -- {escaped_paths}"),
         _ => format!("tar -czf - -- {escaped_paths}"),
     }
@@ -1780,6 +2751,9 @@ fn build_remote_extract_command(
     let archive = escape_shell_arg(remote_archive_path);
     let destination = escape_shell_arg(extract_destination);
     let extract_command = match archive_format {
+        "tar" => format!("mkdir -p {destination} && tar -xf {archive} -C {destination}"),
+        "tar_bz2" => format!("mkdir -p {destination} && tar -xjf {archive} -C {destination}"),
+        "tar_xz" => format!("mkdir -p {destination} && tar -xJf {archive} -C {destination}"),
         "zip" => format!("unzip -oq {archive} -d {destination}"),
         _ => format!("mkdir -p {destination} && tar -xzf {archive} -C {destination}"),
     };
@@ -2332,7 +3306,7 @@ fn transfer_upload(
     if extract_after_upload && upload_archive_format.is_none() {
         return Err(ErrorDto::new(
             ErrorCode::Unsupported,
-            "仅支持对 .tar.gz/.tgz/.zip 文件执行上传后解压",
+            "仅支持对 .tar.gz/.tgz/.tar/.tar.bz2/.tbz2/.tbz/.tar.xz/.txz/.zip 文件执行上传后解压",
         ));
     }
 
@@ -2354,12 +3328,7 @@ fn transfer_upload(
         .extract_destination
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            Path::new(&remote_path)
-                .parent()
-                .map(path_to_string)
-                .unwrap_or_else(|| ".".to_string())
-        });
+        .unwrap_or_else(|| default_extract_destination(&remote_path));
 
     let transfer_id = Uuid::new_v4().to_string();
     let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
@@ -2686,10 +3655,29 @@ fn spawn_terminal_with_command(
                 }
             }
         }
+        if let Some(current) = app_handle
+            .state::<TerminalManager>()
+            .sessions
+            .lock()
+            .remove(&terminal_id_for_thread)
+        {
+            for path in current.cleanup_paths {
+                let _ = fs::remove_file(path);
+            }
+        }
+        cleanup_ssh_connection(
+            &app_handle,
+            &app_handle.state::<SshConnectionManager>(),
+            &app_handle.state::<MonitorManager>(),
+            &terminal_id_for_thread,
+        );
     });
 
     emit_terminal_status(app, &terminal_id, TerminalState::Ready, None);
-    Ok(TerminalSessionDto { terminal_id })
+    Ok(TerminalSessionDto {
+        terminal_id,
+        connection_id: None,
+    })
 }
 
 fn detect_shell(shell_profile: Option<String>) -> String {
@@ -2722,9 +3710,11 @@ fn terminal_spawn_local(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn terminal_connect_ssh(
     app: tauri::AppHandle,
     terminal_manager: State<TerminalManager>,
+    ssh_connection_manager: State<SshConnectionManager>,
     hosts_manager: State<HostsStoreManager>,
     known_hosts_manager: State<KnownHostsStoreManager>,
     vault_manager: State<VaultManager>,
@@ -2739,10 +3729,13 @@ fn terminal_connect_ssh(
         .find(|item| item.host_id == host_id)
         .ok_or_else(|| ErrorDto::new(ErrorCode::NotFound, "Host 不存在"))?;
 
+    let host = host.clone();
     let auth_mode = normalize_auth_mode(&host.auth_mode);
     let proxy_jump = validate_proxy_jump(&host.proxy_jump)?;
     let one_time_password = prepare_one_time_password(&auth_mode, password)?;
-    ensure_known_host_trusted(&app, &known_hosts_manager, host)?;
+    let prepared_auth =
+        prepare_sftp_auth(&host, &auth_mode, one_time_password.clone(), &vault_manager)?;
+    ensure_known_host_trusted(&app, &known_hosts_manager, &host)?;
 
     let known_hosts_path = known_hosts_ssh_path(&app)?;
     let null_known_hosts = if cfg!(target_os = "windows") {
@@ -2814,7 +3807,15 @@ fn terminal_connect_ssh(
     }
     cmd.arg(format!("{}@{}", host.username, host.address));
 
-    spawn_terminal_with_command(&app, &terminal_manager, cmd, cleanup_paths)
+    let mut response = spawn_terminal_with_command(&app, &terminal_manager, cmd, cleanup_paths)?;
+    let connection_id = register_ssh_connection(
+        &ssh_connection_manager,
+        &response.terminal_id,
+        host,
+        prepared_auth,
+    );
+    response.connection_id = Some(connection_id);
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2872,6 +3873,8 @@ fn terminal_resize(
 fn terminal_close(
     app: tauri::AppHandle,
     manager: State<TerminalManager>,
+    ssh_connection_manager: State<SshConnectionManager>,
+    monitor_manager: State<MonitorManager>,
     terminal_id: String,
 ) -> Result<(), ErrorDto> {
     let session = manager.sessions.lock().remove(&terminal_id);
@@ -2889,6 +3892,12 @@ fn terminal_close(
             TerminalState::Closed,
             Some("终端会话已手动关闭".to_string()),
         );
+        cleanup_ssh_connection(
+            &app,
+            &ssh_connection_manager,
+            &monitor_manager,
+            &terminal_id,
+        );
         return Ok(());
     }
 
@@ -2899,6 +3908,8 @@ fn terminal_close(
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
+        .manage(SshConnectionManager::default())
+        .manage(MonitorManager::default())
         .manage(HostsStoreManager::default())
         .manage(KnownHostsStoreManager::default())
         .manage(VaultManager::default())
@@ -2916,10 +3927,17 @@ pub fn run() {
             vault_lock,
             key_import_private_key,
             key_list,
+            monitor_subscribe,
+            monitor_unsubscribe,
+            monitor_set_path_probe,
             fs_list_remote,
             fs_delete_remote,
             fs_read_text,
             fs_write_text_atomic,
+            process_list_remote,
+            process_signal_remote,
+            service_list_remote,
+            service_action_remote,
             transfer_download,
             archive_pack_stream_download,
             transfer_upload,
