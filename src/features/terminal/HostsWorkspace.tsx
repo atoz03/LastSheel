@@ -188,6 +188,25 @@ function askConflictPolicy(defaultValue: "rename" | "overwrite" | "skip" = "rena
   return "rename";
 }
 
+function askArchiveFormat(defaultValue: "tar_gz" | "zip" = "tar_gz"): "tar_gz" | "zip" | null {
+  const value = window.prompt("压缩格式：tar_gz / zip", defaultValue);
+  if (value === null) {
+    return null;
+  }
+  return value.trim().toLowerCase() === "zip" ? "zip" : "tar_gz";
+}
+
+function detectArchiveFormatFromLocalPath(localPath: string): "tar_gz" | "zip" | null {
+  const normalized = localPath.trim().toLowerCase();
+  if (normalized.endsWith(".tar.gz") || normalized.endsWith(".tgz")) {
+    return "tar_gz";
+  }
+  if (normalized.endsWith(".zip")) {
+    return "zip";
+  }
+  return null;
+}
+
 function buildTextDiffPreview(originalText: string, currentText: string): string {
   if (originalText === currentText) {
     return "无变更";
@@ -853,6 +872,11 @@ export function HostsWorkspace() {
       setNotice("已取消压缩下载。");
       return;
     }
+    const archiveFormat = askArchiveFormat("tar_gz");
+    if (archiveFormat === null) {
+      setNotice("已取消压缩下载。");
+      return;
+    }
     const conflictPolicy = askConflictPolicy("rename");
     if (conflictPolicy === null) {
       setNotice("已取消压缩下载。");
@@ -868,7 +892,7 @@ export function HostsWorkspace() {
         input: {
           hostId: host.host_id,
           paths: targets,
-          archiveFormat: "tar_gz",
+          archiveFormat,
           localPath: customLocalPath.trim() ? customLocalPath.trim() : null,
           password,
           conflictPolicy,
@@ -878,13 +902,13 @@ export function HostsWorkspace() {
         transfer_id: response.transfer_id,
         direction: "download",
         host_alias: host.alias,
-        target_path: `压缩下载(${targets.length}项)`,
+        target_path: `压缩下载(${targets.length}项/${archiveFormat})`,
         state: "queued",
         done_bytes: 0,
         total_bytes: null,
         message: response.resolved_local_path ?? "压缩下载任务已创建",
       });
-      setNotice(`压缩下载任务已创建：${targets.length} 项。`);
+      setNotice(`压缩下载任务已创建：${targets.length} 项，格式 ${archiveFormat}。`);
     } catch (error: unknown) {
       const payload = getInvokeError(error);
       if (payload.code === "AUTH_FAILED") {
@@ -1093,6 +1117,25 @@ export function HostsWorkspace() {
       setNotice("远端路径不能为空。");
       return;
     }
+    const archiveFormat = detectArchiveFormatFromLocalPath(localPath);
+    let extractAfterUpload = false;
+    let extractDestination: string | null = null;
+    let removeArchiveAfterExtract = false;
+    if (archiveFormat) {
+      extractAfterUpload = window.confirm("检测到压缩包，是否在远端上传完成后自动解压？");
+      if (extractAfterUpload) {
+        const defaultDestination = remotePath.trim().endsWith("/")
+          ? remotePath.trim()
+          : remotePath.trim().replace(/\/[^/]+$/, "") || currentCwd || ".";
+        const value = window.prompt("请输入远端解压目录", defaultDestination === "-" ? "." : defaultDestination);
+        if (value === null) {
+          setNotice("已取消上传。");
+          return;
+        }
+        extractDestination = value.trim() || ".";
+        removeArchiveAfterExtract = window.confirm("解压完成后删除远端压缩包吗？");
+      }
+    }
     const conflictPolicy = askConflictPolicy("rename");
     if (conflictPolicy === null) {
       setNotice("已取消上传。");
@@ -1111,6 +1154,9 @@ export function HostsWorkspace() {
           remotePath: remotePath.trim(),
           password,
           conflictPolicy,
+          extractAfterUpload,
+          extractDestination,
+          removeArchiveAfterExtract,
         },
       });
       upsertTransferItem({
@@ -1121,9 +1167,11 @@ export function HostsWorkspace() {
         state: "queued",
         done_bytes: 0,
         total_bytes: null,
-        message: response.resolved_remote_path ? `目标：${response.resolved_remote_path}` : undefined,
+        message: response.resolved_remote_path
+          ? `${extractAfterUpload ? "上传并解压" : "目标"}：${response.resolved_remote_path}`
+          : undefined,
       });
-      setNotice("上传任务已创建。");
+      setNotice(extractAfterUpload ? "上传并解压任务已创建。" : "上传任务已创建。");
     } catch (error: unknown) {
       const payload = getInvokeError(error);
       if (payload.code === "AUTH_FAILED") {

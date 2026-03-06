@@ -266,6 +266,9 @@ pub struct TransferUploadInputDto {
     pub remote_path: String,
     pub password: Option<String>,
     pub conflict_policy: Option<String>,
+    pub extract_after_upload: Option<bool>,
+    pub extract_destination: Option<String>,
+    pub remove_archive_after_extract: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

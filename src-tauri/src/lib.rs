@@ -464,6 +464,23 @@ fn normalize_conflict_policy(input: Option<&str>, default_value: &str) -> String
     }
 }
 
+fn normalize_archive_format(input: Option<&str>, default_value: &str) -> Result<String, ErrorDto> {
+    match input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_value)
+        .to_lowercase()
+        .as_str()
+    {
+        "tar_gz" | "tgz" => Ok("tar_gz".to_string()),
+        "zip" => Ok("zip".to_string()),
+        _ => Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "当前仅支持 tar_gz 或 zip 压缩格式",
+        )),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn prepare_one_time_password(
     auth_mode: &str,
@@ -1706,13 +1723,110 @@ fn resolve_archive_download_target_path(
     }
 }
 
-fn build_remote_tar_command(paths: &[String]) -> String {
+fn escape_shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn archive_extension(archive_format: &str) -> &'static str {
+    match archive_format {
+        "zip" => "zip",
+        _ => "tar.gz",
+    }
+}
+
+fn archive_dependency_command(archive_format: &str) -> &'static str {
+    match archive_format {
+        "zip" => "zip",
+        _ => "tar",
+    }
+}
+
+fn extract_dependency_command(archive_format: &str) -> &'static str {
+    match archive_format {
+        "zip" => "unzip",
+        _ => "tar",
+    }
+}
+
+fn detect_archive_format_from_path(path: &str) -> Option<&'static str> {
+    let normalized = path.trim().to_lowercase();
+    if normalized.ends_with(".tar.gz") || normalized.ends_with(".tgz") {
+        return Some("tar_gz");
+    }
+    if normalized.ends_with(".zip") {
+        return Some("zip");
+    }
+    None
+}
+
+fn build_remote_archive_command(paths: &[String], archive_format: &str) -> String {
     let escaped_paths = paths
         .iter()
-        .map(|path| format!("'{}'", path.replace('\'', "'\"'\"'")))
+        .map(|path| escape_shell_arg(path))
         .collect::<Vec<_>>()
         .join(" ");
-    format!("tar -czf - -- {escaped_paths}")
+    match archive_format {
+        "zip" => format!("zip -qry - -- {escaped_paths}"),
+        _ => format!("tar -czf - -- {escaped_paths}"),
+    }
+}
+
+fn build_remote_extract_command(
+    archive_format: &str,
+    remote_archive_path: &str,
+    extract_destination: &str,
+    remove_archive_after_extract: bool,
+) -> String {
+    let archive = escape_shell_arg(remote_archive_path);
+    let destination = escape_shell_arg(extract_destination);
+    let extract_command = match archive_format {
+        "zip" => format!("unzip -oq {archive} -d {destination}"),
+        _ => format!("mkdir -p {destination} && tar -xzf {archive} -C {destination}"),
+    };
+    if remove_archive_after_extract {
+        format!("{extract_command} && rm -f {archive}")
+    } else {
+        extract_command
+    }
+}
+
+fn run_remote_command_checked(
+    host: &HostItemDto,
+    prepared_auth: &PreparedSshAuth,
+    command: &str,
+    error_prefix: &str,
+) -> Result<(), ErrorDto> {
+    let session = open_authenticated_session(host, prepared_auth)?;
+    let mut channel = session.channel_session().map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：创建远端命令通道失败"),
+        )
+    })?;
+    channel.exec(command).map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：启动远端命令失败"),
+        )
+    })?;
+    channel.wait_close().map_err(|_| {
+        ErrorDto::new(
+            ErrorCode::IoError,
+            format!("{error_prefix}：等待远端命令结束失败"),
+        )
+    })?;
+    let status = channel.exit_status().unwrap_or(1);
+    if status == 0 {
+        return Ok(());
+    }
+    let mut stderr_text = String::new();
+    let _ = channel.stderr().read_to_string(&mut stderr_text);
+    let message = if stderr_text.trim().is_empty() {
+        format!("{error_prefix}：远端命令执行失败")
+    } else {
+        format!("{error_prefix}：{}", stderr_text.trim())
+    };
+    Err(ErrorDto::new(ErrorCode::IoError, message))
 }
 
 fn resolve_remote_conflict_path(
@@ -1979,18 +2093,7 @@ fn archive_pack_stream_download(
     transfer_manager: State<TransferManager>,
     input: ArchivePackDownloadInputDto,
 ) -> Result<TransferStartDto, ErrorDto> {
-    if input
-        .archive_format
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("tar_gz"))
-    {
-        return Err(ErrorDto::new(
-            ErrorCode::Unsupported,
-            "当前仅支持 tar_gz 压缩下载",
-        ));
-    }
+    let archive_format = normalize_archive_format(input.archive_format.as_deref(), "tar_gz")?;
     let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
     if !host.proxy_jump.trim().is_empty() {
         return Err(ErrorDto::new(
@@ -2016,9 +2119,10 @@ fn archive_pack_stream_download(
 
     let conflict_policy = normalize_conflict_policy(input.conflict_policy.as_deref(), "rename");
     let default_file_name = format!(
-        "{}-bundle-{}.tar.gz",
+        "{}-bundle-{}.{}",
         sanitize_path_segment(&host.alias),
-        current_time_ms()?
+        current_time_ms()?,
+        archive_extension(&archive_format)
     );
     let resolved_local_path = resolve_archive_download_target_path(
         &app,
@@ -2072,20 +2176,29 @@ fn archive_pack_stream_download(
             let mut probe_channel = session
                 .channel_session()
                 .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端命令通道失败"))?;
+            let dependency_command = archive_dependency_command(&archive_format);
             probe_channel
-                .exec("command -v tar >/dev/null 2>&1")
-                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "检测远端 tar 失败"))?;
-            probe_channel
-                .wait_close()
-                .map_err(|_| ErrorDto::new(ErrorCode::IoError, "检测远端 tar 失败"))?;
+                .exec(&format!("command -v {dependency_command} >/dev/null 2>&1"))
+                .map_err(|_| {
+                    ErrorDto::new(
+                        ErrorCode::IoError,
+                        format!("检测远端 {dependency_command} 失败"),
+                    )
+                })?;
+            probe_channel.wait_close().map_err(|_| {
+                ErrorDto::new(
+                    ErrorCode::IoError,
+                    format!("检测远端 {dependency_command} 失败"),
+                )
+            })?;
             if probe_channel.exit_status().unwrap_or(1) != 0 {
                 return Err(ErrorDto::new(
                     ErrorCode::DepMissing,
-                    "远端缺少 tar 命令，无法执行压缩下载",
+                    format!("远端缺少 {dependency_command} 命令，无法执行压缩下载"),
                 ));
             }
 
-            let command = build_remote_tar_command(&selected_paths);
+            let command = build_remote_archive_command(&selected_paths, &archive_format);
             let mut channel = session
                 .channel_session()
                 .map_err(|_| ErrorDto::new(ErrorCode::IoError, "创建远端命令通道失败"))?;
@@ -2203,6 +2316,8 @@ fn transfer_upload(
     let local_path = input.local_path.trim().to_string();
     let remote_path_input = input.remote_path.trim().to_string();
     let conflict_policy = normalize_conflict_policy(input.conflict_policy.as_deref(), "rename");
+    let extract_after_upload = input.extract_after_upload.unwrap_or(false);
+    let remove_archive_after_extract = input.remove_archive_after_extract.unwrap_or(false);
     if local_path.is_empty() || remote_path_input.is_empty() {
         return Err(ErrorDto::new(
             ErrorCode::Unsupported,
@@ -2212,6 +2327,13 @@ fn transfer_upload(
     let local_path_buf = PathBuf::from(local_path.clone());
     if !local_path_buf.exists() {
         return Err(ErrorDto::new(ErrorCode::NotFound, "本地文件不存在"));
+    }
+    let upload_archive_format = detect_archive_format_from_path(&local_path);
+    if extract_after_upload && upload_archive_format.is_none() {
+        return Err(ErrorDto::new(
+            ErrorCode::Unsupported,
+            "仅支持对 .tar.gz/.tgz/.zip 文件执行上传后解压",
+        ));
     }
 
     let host = load_host_for_remote_operation(&app, &hosts_manager, &input.host_id)?;
@@ -2228,6 +2350,16 @@ fn transfer_upload(
     let preview_sftp = open_authenticated_sftp(&host, &prepared_auth)?;
     let remote_path =
         resolve_remote_conflict_path(&preview_sftp, &remote_path_input, &conflict_policy)?;
+    let extract_destination = input
+        .extract_destination
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            Path::new(&remote_path)
+                .parent()
+                .map(path_to_string)
+                .unwrap_or_else(|| ".".to_string())
+        });
 
     let transfer_id = Uuid::new_v4().to_string();
     let canceled = insert_transfer_control(&transfer_manager, &transfer_id);
@@ -2297,6 +2429,51 @@ fn transfer_upload(
                     None,
                 );
             }
+            if extract_after_upload {
+                if canceled.load(Ordering::Relaxed) {
+                    return Err(ErrorDto::new(ErrorCode::Canceled, "上传已取消"));
+                }
+                let archive_format = upload_archive_format.ok_or_else(|| {
+                    ErrorDto::new(ErrorCode::Unsupported, "当前文件格式不支持远端自动解压")
+                })?;
+                let dependency_command = extract_dependency_command(archive_format);
+                run_remote_command_checked(
+                    &host,
+                    &prepared_auth,
+                    &format!("command -v {dependency_command} >/dev/null 2>&1"),
+                    &format!("检测远端 {dependency_command}"),
+                )
+                .map_err(|error| {
+                    if matches!(error.code, ErrorCode::IoError) {
+                        ErrorDto::new(
+                            ErrorCode::DepMissing,
+                            format!("远端缺少 {dependency_command} 命令，无法自动解压"),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                emit_transfer_update(
+                    &app_handle,
+                    &transfer_id_for_thread,
+                    TransferState::Running,
+                    done_bytes,
+                    total_bytes,
+                    Some(format!("上传完成，开始解压到 {extract_destination}")),
+                );
+                let extract_command = build_remote_extract_command(
+                    archive_format,
+                    &remote_path_for_thread,
+                    &extract_destination,
+                    remove_archive_after_extract,
+                );
+                run_remote_command_checked(
+                    &host,
+                    &prepared_auth,
+                    &extract_command,
+                    "远端自动解压",
+                )?;
+            }
             Ok((done_bytes, total_bytes))
         })();
 
@@ -2314,7 +2491,11 @@ fn transfer_upload(
                     TransferState::Done,
                     done_bytes,
                     total_bytes,
-                    Some("上传完成".to_string()),
+                    Some(if extract_after_upload {
+                        format!("上传并解压完成：{extract_destination}")
+                    } else {
+                        "上传完成".to_string()
+                    }),
                 )
             }
             Err(error) => {
